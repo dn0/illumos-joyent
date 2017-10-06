@@ -20,7 +20,7 @@
 #
 #
 # Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
-# Copyright (c) 2012, Joyent, Inc.  All rights reserved.
+# Copyright (c) 2017, Joyent, Inc.
 #
 
 #
@@ -49,6 +49,13 @@ LOAD_SEGMENT umem {
 };
 $endif
 
+SYMBOL_VERSION ILLUMOS_1.0 {
+    global:
+	umem_realloc;
+	umem_calloc;
+	umem_reallocarray;
+	umem_cfree;
+} SUNW_1.1;
 
 SYMBOL_VERSION SUNW_1.1 {
     global:

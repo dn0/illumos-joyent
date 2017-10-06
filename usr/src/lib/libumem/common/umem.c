@@ -25,7 +25,7 @@
  */
 
 /*
- * Copyright (c) 2014 Joyent, Inc.  All rights reserved.
+ * Copyright (c) 2017, Joyent, Inc.
  * Copyright (c) 2015 by Delphix. All rights reserved.
  */
 
@@ -2263,6 +2263,86 @@ _umem_free_align(void *buf, size_t size)
 	if (buf == NULL && size == 0)
 		return;
 	vmem_xfree(umem_memalign_arena, buf, size);
+}
+
+#pragma weak umem_calloc = _umem_calloc
+void *
+_umem_calloc(size_t nelem, size_t elsize, int umflag)
+{
+	size_t total;
+
+	if (nelem == 0 || elsize == 0) {
+		total = 0;
+	} else {
+		total = nelem * elsize;
+
+		/* check for overflow */
+		if (total / nelem != elsize) {
+			errno = ENOMEM; /* XXX: EOVERFLOW instead? */
+			return (NULL);
+		}
+	}
+
+	return (_umem_zalloc(total, umflag));
+}
+
+#pragma weak umem_realloc = _umem_realloc
+void *
+_umem_realloc(void *ptr, size_t oldsize, size_t newsize, int umflag)
+{
+	void *newptr;
+
+	if (ptr == NULL)
+		return (_umem_alloc(newsize, umflag));
+
+	if ((newptr = _umem_alloc(newsize, umflag)) == NULL)
+		return (NULL);
+
+	(void) memcpy(newptr, ptr, MIN(oldsize, newsize));
+	explicit_bzero(ptr, oldsize);
+	_umem_free(ptr, oldsize);
+
+	return (newptr);
+}
+
+#pragma weak umem_reallocarray = _umem_reallocarray
+void *
+_umem_reallocarray(void *ptr, size_t oldnelem, size_t nelem, size_t elsize,
+    int umflag)
+{
+	void *newptr;
+	size_t newtotal, oldtotal;
+
+	if (ptr == NULL)
+		return (_umem_calloc(nelem, elsize, umflag));
+
+	newtotal = nelem * elsize;
+	if (newtotal / nelem != elsize) {
+			errno = ENOMEM;
+			return (NULL);
+	}
+
+	oldtotal = oldnelem * elsize;
+	if (oldtotal / nelem != elsize) {
+		errno = EINVAL;
+		return (NULL);
+	}
+
+	if ((newptr = _umem_zalloc(newtotal, umflag)) == NULL)
+		return (NULL);
+
+	(void) memcpy(newptr, ptr, MIN(oldtotal, newtotal));
+	explicit_bzero(ptr, oldtotal);
+	_umem_free(ptr, oldtotal);
+
+	return (newptr);
+}
+
+#pragma weak umem_cfree = _umem_cfree
+void
+_umem_cfree(void *ptr, size_t nelem, size_t elsize)
+{
+	_umem_free(ptr, nelem * elsize);
 }
 
 static void *
