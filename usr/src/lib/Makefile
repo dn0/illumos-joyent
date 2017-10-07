@@ -187,6 +187,7 @@ SUBDIRS +=				\
 	libraidcfg	\
 	librcm		\
 	librdc		\
+	librefhash	\
 	librename	\
 	libreparse	\
 	libresolv	\
