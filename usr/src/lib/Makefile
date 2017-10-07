@@ -176,6 +176,7 @@ SUBDIRS +=				\
 	libpam		\
 	libpcidb	\
 	libpctx		\
+	libperiodic	\
 	libpicl		\
 	libpicltree	\
 	libpkg		\
