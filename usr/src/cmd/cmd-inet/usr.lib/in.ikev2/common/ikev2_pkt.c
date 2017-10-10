@@ -28,7 +28,6 @@
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <pthread.h>
 #include <note.h>
 #include <stdarg.h>
 #include "defs.h"
@@ -106,8 +105,7 @@ ikev2_pkt_new_response(const pkt_t *init)
 
 /* Allocate a ikev2_pkt_t for an inbound datagram in raw */
 pkt_t *
-ikev2_pkt_new_inbound(uint8_t *restrict buf, size_t buflen,
-    bunyan_logger_t *restrict l)
+ikev2_pkt_new_inbound(void *restrict buf, size_t buflen)
 {
 	const ike_header_t	*hdr = NULL;
 	pkt_t			*pkt = NULL;
@@ -115,7 +113,9 @@ ikev2_pkt_new_inbound(uint8_t *restrict buf, size_t buflen,
 	size_t			i = 0;
 	boolean_t		keep = B_TRUE;
 
-	(void) bunyan_trace(l, "Creating new inbound IKEV2 packet",
+	VERIFY(IS_WORKER);
+
+	(void) bunyan_trace(worker->w_log, "Creating new inbound IKEV2 packet",
 	    BUNYAN_T_END);
 
 	ASSERT(IS_P2ALIGNED(buf, sizeof (uint64_t)));
@@ -135,14 +135,15 @@ ikev2_pkt_new_inbound(uint8_t *restrict buf, size_t buflen,
 	case IKEV2_EXCH_GSA_REGISTRATION:
 	case IKEV2_EXCH_GSA_REKEY:
 	default:
-		(void) bunyan_info(l, "Unknown/unsupported exchange type",
+		(void) bunyan_info(worker->w_log,
+		    "Unknown/unsupported exchange type",
 		    BUNYAN_T_STRING, "exch_type",
 		    ikev2_exch_str(hdr->exch_type), BUNYAN_T_END);
 		return (NULL);
 	}
 
 	/* pkt_in_alloc() will log any errors messages */
-	if ((pkt = pkt_in_alloc(buf, buflen, l)) == NULL)
+	if ((pkt = pkt_in_alloc(buf, buflen)) == NULL)
 		return (NULL);
 
 	if (!check_payloads(pkt)) {

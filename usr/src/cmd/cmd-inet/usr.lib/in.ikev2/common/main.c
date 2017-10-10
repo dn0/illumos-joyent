@@ -35,7 +35,6 @@
 #include "ikev2_sa.h"
 #include "inbound.h"
 #include "pkcs11.h"
-#include "timer.h"
 #include "worker.h"
 
 extern void pkt_init(void);
@@ -50,7 +49,7 @@ static void main_loop(void);
 static void do_immediate(void);
 
 static boolean_t done;
-static pthread_t signal_tid;
+static thread_t signal_tid;
 
 bunyan_logger_t *log = NULL;
 int main_port = -1;
@@ -83,6 +82,19 @@ _umem_debug_init(void)
 }
 #endif
 
+static int
+nofail_cb(void)
+{
+	/*
+	 * XXX Do we want to maybe change behavior based on debug/non-debug
+	 * or make it a configuration or maybe SMF parameter to control
+	 * abort vs. exit vs. something else?
+	 */
+	assfail("Out of memory", __FILE__, __LINE__);
+	/*NOTREACHED*/
+	return (UMEM_CALLBACK_EXIT(EXIT_FAILURE));
+}
+
 int
 main(int argc, char **argv)
 {
@@ -97,6 +109,8 @@ main(int argc, char **argv)
 #define	TEXT_DOMAIN "SYS_TEST"
 #endif
 	(void) textdomain(TEXT_DOMAIN);
+
+	umem_nofail_callback(nofail_cb);
 
 	while ((c = getopt(argc, argv, "cdf:")) != -1) {
 		switch (c) {
@@ -187,21 +201,15 @@ main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	if ((inbound_port = port_create()) < 0) {
-		STDERR(fatal, log, "inbound port_create() failed");
-		exit(EXIT_FAILURE);
-	}
-
 	signal_init();
 	pkcs11_init();
 	pkt_init();
-	ike_timer_init();
 	ikev2_sa_init();
 
 	/* XXX: make these configurable */
-	worker_init(8, 8);
+	worker_init(8);
 	pfkey_init();
-	inbound_init(2);
+	inbound_init();
 	main_loop();
 
 	pkt_fini();
@@ -248,8 +256,7 @@ do_immediate(void)
 		    BUNYAN_T_STRING, "rule", rule->rule_label,
 		    BUNYAN_T_END);
 
-		worker_dispatch(WMSG_START, sa,
-		    I2SA_LOCAL_SPI(sa) % wk_nworkers);
+		VERIFY(worker_send_cmd(WC_START, sa));
 	}
 
 	CONFIG_REFRELE(cfg);
@@ -266,6 +273,8 @@ main_loop(void)
 
 	/*CONSTCOND*/
 	while (!done) {
+		char portsrc[PORT_SOURCE_STR_LEN];
+
 		if (port_get(main_port, &pe, NULL) < 0) {
 			STDERR(error, log, "port_get() failed");
 			continue;
@@ -273,7 +282,8 @@ main_loop(void)
 
 		(void) bunyan_trace(log, "received event",
 		    BUNYAN_T_STRING, "source",
-		    port_source_str(pe.portev_source),
+		    port_source_str(pe.portev_source, portsrc,
+		    sizeof (portsrc)),
 		    BUNYAN_T_STRING, "event",
 		    event_str(pe.portev_events),
 		    BUNYAN_T_UINT32, "event num",
@@ -350,7 +360,8 @@ signal_thread(void *arg)
 	sigset_t sigset;
 	int signo;
 
-	bunyan_trace(log, "signal thread awaiting signals", BUNYAN_T_END);
+	(void) bunyan_trace(log, "signal thread awaiting signals",
+	    BUNYAN_T_END);
 
 	(void) sigfillset(&sigset);
 
@@ -386,7 +397,8 @@ signal_init(void)
 	sigset_t nset;
 	int rc;
 
-	bunyan_trace(log, "Creating signal handling thread", BUNYAN_T_END);
+	(void) bunyan_trace(log, "Creating signal handling thread",
+	    BUNYAN_T_END);
 
 	/* block all signals in main thread */
 	(void) sigfillset(&nset);

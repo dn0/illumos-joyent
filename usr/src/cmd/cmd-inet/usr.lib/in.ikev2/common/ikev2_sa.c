@@ -33,10 +33,10 @@
 #include <umem.h>
 #include <errno.h>
 #include <ipsec_util.h>
+#include <libperiodic.h>
 #include <limits.h>
 #include <locale.h>
 #include <note.h>
-#include <pthread.h>
 #include <stddef.h>
 #include <strings.h>
 #include <sys/debug.h>
@@ -53,7 +53,6 @@
 #include "ilist.h"
 #include "pkcs11.h"
 #include "pkt.h"
-#include "timer.h"
 #include "worker.h"
 
 struct i2sa_bucket {
@@ -101,7 +100,7 @@ static ikev2_sa_t *i2sa_verify(ikev2_sa_t *restrict, uint64_t,
 static boolean_t i2sa_add_to_hash(i2sa_hash_t, ikev2_sa_t *);
 
 static void i2sa_unlink(ikev2_sa_t *);
-static void i2sa_expire_cb(te_event_t, void *data);
+static void i2sa_p1_expire(void *);
 
 static boolean_t i2sa_key_add_addr(ikev2_sa_t *, const char *, const char *,
     const struct sockaddr_storage *);
@@ -199,12 +198,18 @@ ikev2_sa_alloc(boolean_t initiator,
     const struct sockaddr_storage *restrict raddr)
 {
 	ikev2_sa_t	*i2sa = NULL;
+	config_t	*cfg = NULL;
+	hrtime_t	expire = 0;
 
 	(void) bunyan_trace(log, "Attempting to create new larval IKE SA",
 	    BUNYAN_T_BOOLEAN, I2SA_KEY_INITIATOR, initiator,
 	    ss_bunyan(laddr), I2SA_KEY_LADDR, ss_addr(laddr),
 	    ss_bunyan(raddr), I2SA_KEY_RADDR, ss_addr(raddr),
 	    BUNYAN_T_END);
+
+	cfg = config_get();
+	expire = cfg->cfg_expire_timer;
+	CONFIG_REFRELE(cfg);
 
 	if ((i2sa = umem_cache_alloc(i2sa_cache, UMEM_DEFAULT)) == NULL)
 		return (NULL);
@@ -223,8 +228,8 @@ ikev2_sa_alloc(boolean_t initiator,
 	/*
 	 * Generate a random local SPI and try to add it.  Almost always this
 	 * will succeed on the first attempt.  However if on the rare occasion
-	 * we generate a duplicate, just retry until we pick a value that's
-	 * not in use.
+	 * we generate a duplicate (or even far, far rarer chance 0 is
+	 * returned), just retry until we pick a value that's not in use.
 	 */
 	NOTE(CONSTCOND)
 	while (1) {
@@ -293,22 +298,13 @@ ikev2_sa_alloc(boolean_t initiator,
 		    pkt_header(init_pkt)->initiator_spi);
 	}
 
-	/*
-	 * Start SA expiration timer.  We cannot call schedule_timeout()
-	 * from there because we are almost certaintly not running in one
-	 * of the worker threads -- the local SPI cannot be known until
-	 * we exit.  The answer is to have the correct worker schedule it
-	 * for us.
-	 *
-	 * XXX: Should this be reset after we've successfully authenticated?
-	 * My hunch is no, and should only be cleared once the AUTH exchange
-	 * has successfully completed.
-	 */
-	I2SA_REFHOLD(i2sa);
-	if (!worker_dispatch(WMSG_START_P1_TIMER, i2sa,
-	    I2SA_LOCAL_SPI(i2sa) % wk_nworkers)) {
+	I2SA_REFHOLD(i2sa);	/* ref for periodic */
+	if (periodic_schedule(wk_periodic, expire, PERIODIC_ONESHOT,
+	    i2sa_p1_expire, i2sa, &i2sa->i2sa_p1_timer) != 0) {
 		(void) bunyan_error(i2sa->i2sa_log,
-		    "Cannot dispatch WMSG_START_P1_TIMER event; aborting",
+		    "Cannot create IKEv2 SA P1 expiration timer",
+		    BUNYAN_T_STRING, "err", strerror(errno),
+		    BUNYAN_T_INT32, "errno", errno,
 		    BUNYAN_T_END);
 		goto fail;
 	}
@@ -337,42 +333,30 @@ fail:
 	return (NULL);
 }
 
-void
-ikev2_sa_start_timer(ikev2_sa_t *i2sa)
-{
-	config_t *cfg = config_get();
-	hrtime_t expire = cfg->cfg_expire_timer;
-
-	CONFIG_REFRELE(cfg);
-	cfg = NULL;
-
-	/* Pass i2sa reference to timer */
-	if (schedule_timeout(TE_P1_SA_EXPIRE, i2sa_expire_cb, i2sa, expire,
-	    i2sa->i2sa_log))
-		return;
-
-	bunyan_error(i2sa->i2sa_log, "Unable to schedule larval IKE SA timeout",
-	    BUNYAN_T_END);
-
-	ikev2_sa_condemn(i2sa);
-	I2SA_REFRELE(i2sa);
-}
 /*
  * Invoked when an SA has expired.  REF from timer is passed to this
  * function.
  */
 static void
-i2sa_expire_cb(te_event_t evt, void *data)
+i2sa_p1_expire(void *data)
 {
-	NOTE(ARGUNUSED(evt))
-
 	ikev2_sa_t *i2sa = data;
 
-	bunyan_info(i2sa->i2sa_log, "Larval IKE SA timeout; deleting",
+	(void) bunyan_info(i2sa->i2sa_log, "Larval IKE SA timeout",
 	    BUNYAN_T_END);
 
-	ikev2_sa_condemn(i2sa);
-	/* XXX: Anything else? */
+	mutex_enter(&i2sa->i2sa_lock);
+	/* Remove periodic id after one shot timer has fired */
+	i2sa->i2sa_p1_timer = 0;
+
+	if (i2sa->i2sa_state == IKEV2_SA_IDLE) {
+		ikev2_sa_condemn(i2sa);
+		/* XXX: Anything else? */
+	} else {
+		i2sa->flags |= I2SA_P1_EXPIRE;
+	}
+	mutex_exit(&i2sa->i2sa_lock);
+
 	I2SA_REFRELE(i2sa);
 }
 
@@ -395,11 +379,25 @@ ikev2_sa_condemn(ikev2_sa_t *i2sa)
 
 	i2sa->flags |= I2SA_CONDEMNED;
 
-	if (i2sa->last_sent != NULL)
-		(void) cancel_timeout(TE_TRANSMIT, i2sa, i2sa->i2sa_log);
+	/*
+	 * Unlike the the other timers, which are all currently one shot, this
+	 * one repeats, so if the id is set, it should be there to cancel.
+	 */
+	if (i2sa->last_sent != NULL && i2sa->i2sa_xmit_timer != 0)
+		VERIFY0(periodic_cancel(wk_periodic, i2sa->i2sa_xmit_timer));
 
-	if (cancel_timeout(TE_P1_SA_EXPIRE, i2sa, i2sa->i2sa_log) > 0)
-		I2SA_REFRELE(i2sa);
+	/*
+	 * However these may have fired in another thread, so if they're gone
+	 * it's ok.
+	 */
+	if (i2sa->i2sa_p1_timer != 0)
+		(void) periodic_cancel(wk_periodic, i2sa->i2sa_p1_timer);
+	if (i2sa->i2sa_softlife_timer != 0)
+		(void) periodic_cancel(wk_periodic, i2sa->i2sa_softlife_timer);
+	if (i2sa->i2sa_hardlife_timer != 0)
+		(void) periodic_cancel(wk_periodic, i2sa->i2sa_hardlife_timer);
+	i2sa->i2sa_p1_timer = i2sa->i2sa_softlife_timer =
+	    i2sa->i2sa_xmit_timer = i2sa->i2sa_hardlife_timer = 0;
 
 	/*
  	* Since packets keep a reference to the SA they are associated with,
@@ -421,6 +419,11 @@ ikev2_sa_condemn(ikev2_sa_t *i2sa)
 	i2sa->last_resp_sent = NULL;
 	i2sa->last_sent = NULL;
 	i2sa->last_recvd = NULL;
+
+	for (size_t i = 0; i < IKEV2_SA_QUEUE_DEPTH; i++) {
+		ikev2_pkt_free(i2sa->i2sa_queue[i]);
+		i2sa->i2sa_queue[i] = NULL;
+	}
 
 	mutex_exit(&i2sa->i2sa_lock);
 

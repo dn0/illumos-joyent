@@ -78,7 +78,7 @@
  * setsockopt()s (e.g. IP_SEC_OPT(NEVER)) have already performed on socket.
  */
 ssize_t
-recvfromto(int s, uint8_t *restrict buf, size_t buflen, int flags,
+recvfromto(int s, void *restrict buf, size_t buflen, int flags,
     struct sockaddr_storage *restrict from, socklen_t *restrict fromlen,
     struct sockaddr_storage *restrict to, socklen_t *restrict tolen)
 {

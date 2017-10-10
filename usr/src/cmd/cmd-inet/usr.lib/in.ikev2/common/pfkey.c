@@ -772,6 +772,8 @@ pfkey_thread(void *arg)
 	(void) bunyan_trace(pflog, "pfkey thread starting", BUNYAN_T_END);
 
 	while (!stop) {
+		char portstr[PORT_SOURCE_STR_LEN];
+
 		if (port_get(pfport, &pe, NULL) < 0) {
 			STDERR(fatal, pflog, "port_get() failed");
 			exit(EXIT_FAILURE);
@@ -780,7 +782,8 @@ pfkey_thread(void *arg)
 		(void) bunyan_debug(pflog, "Received port event",
 		    BUNYAN_T_INT32, "event", pe.portev_events,
 		    BUNYAN_T_STRING, "source",
-		    port_source_str(pe.portev_source),
+		    port_source_str(pe.portev_source, portstr,
+		    sizeof (portstr)),
 		    BUNYAN_T_POINTER, "object", pe.portev_object,
 		    BUNYAN_T_POINTER, "cookie", pe.portev_user,
 		    BUNYAN_T_END);

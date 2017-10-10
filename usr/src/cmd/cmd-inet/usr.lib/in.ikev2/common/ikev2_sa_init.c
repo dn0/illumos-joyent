@@ -13,26 +13,24 @@
  * Copyright (c) 2017 Joyent, Inc.
  */
 
-#include <pthread.h>
-#include <umem.h>
-#include <err.h>
-#include <sys/debug.h>
 #include <bunyan.h>
-#include <time.h>
+#include <err.h>
 #include <string.h>
+#include <sys/debug.h>
+#include <time.h>
+#include <umem.h>
+#include "config.h"
 #include "defs.h"
-#include "worker.h"
-#include "pkt.h"
-#include "timer.h"
-#include "pkcs11.h"
+#include "dh.h"
+#include "ikev2_common.h"
+#include "ikev2_enum.h"
+#include "ikev2_pkt.h"
 #include "ikev2_proto.h"
 #include "ikev2_sa.h"
-#include "config.h"
-#include "ikev2_pkt.h"
-#include "ikev2_enum.h"
-#include "ikev2_common.h"
+#include "pkcs11.h"
+#include "pkt.h"
 #include "prf.h"
-#include "dh.h"
+#include "worker.h"
 
 static void ikev2_sa_init_inbound_init(pkt_t *);
 static void ikev2_sa_init_inbound_resp(pkt_t *);
@@ -221,8 +219,8 @@ redo_init(pkt_t *pkt)
 		uint16_t val = BE_IN16(invalid_ke->pn_ptr);
 		dh = val;
 	}
-
-	(void) cancel_timeout(TE_TRANSMIT, out, sa->i2sa_log);
+	(void) periodic_cancel(wk_periodic, sa->i2sa_xmit_timer);
+	sa->i2sa_xmit_timer = 0;
 	ikev2_sa_init_outbound(sa, cookie->pn_ptr, cookie->pn_len,
 	    dh, nonce->pp_ptr, nonce->pp_len);
 

@@ -31,6 +31,7 @@
 #define	_IKEV2_SA_H
 
 #include <atomic.h>
+#include <libperiodic.h>
 #include <security/cryptoki.h>
 #include <sys/list.h>
 #include <sys/types.h>
@@ -76,20 +77,7 @@ typedef enum ikev2_sa_state {
 	IKEV2_SA_BUSY,
 } ikev2_sa_state_t;
 
-typedef enum ikev2_sa_event {
-	SAE_NONE = 0,
-	SAE_PKT,
-	SAE_P1_EXPIRE,
-	SAE_SOFT_EXPIRE,
-	SAE_HARD_EXPIRE
-} ikev2_sa_event_t;
-
 #define	IKEV2_SA_QUEUE_DEPTH	16
-typedef struct ikev2_sa_queue_entry {
-	ikev2_sa_event_t	sqe_event;
-	void			*sqe_data;
-} ikev2_sa_queue_entry_t;
-
 /*
  * The IKEv2 SA.
  *
@@ -181,8 +169,13 @@ struct ikev2_sa_s {
 	uint8_t		salt_r[I2SA_SALT_LEN];
 	size_t		saltlen;
 
+	periodic_id_t		i2sa_xmit_timer;
+	periodic_id_t		i2sa_p1_timer;
+	periodic_id_t		i2sa_softlife_timer;
+	periodic_id_t		i2sa_hardlife_timer;
+
 	mutex_t			i2sa_queue_lock;
-	ikev2_sa_queue_entry_t	i2sa_queue[IKEV2_SA_QUEUE_DEPTH];
+	struct pkt_s		*i2sa_queue[IKEV2_SA_QUEUE_DEPTH];
 	size_t			i2sa_queue_start;
 	size_t			i2sa_queue_end;
 };
@@ -206,6 +199,9 @@ struct ikev2_child_sa {
 #define	I2SA_NAT_REMOTE		0x4	/* My peer is behind a NAT. */
 #define	I2SA_CONDEMNED		0x8	/* SA is unlinked from a tree. */
 #define	I2SA_AUTHENTICATED	0x10	/* SA has been authenticated */
+#define	I2SA_P1_EXPIRE		0x20	/* P1 expire timer has fired */
+#define	I2SA_SOFT_EXPIRE	0x40	/* Soft lifetime has fired */
+#define	I2SA_HARD_EXPIRE	0x80	/* Hard lifetime has fired */
 
 #define	I2SA_LOCAL_SPI(i2sa) \
 	(((i2sa)->flags & I2SA_INITIATOR) ? (i2sa)->i_spi : \
@@ -230,6 +226,13 @@ struct ikev2_child_sa {
 	(void) ((atomic_dec_32_nv(&(i2sa)->refcnt) != 0) || \
 	    (ikev2_sa_free(i2sa), 0))
 
+#define	I2SA_QUEUE_EMPTY(i2sa) \
+	((i2sa)->i2sa_queue_start == (i2sa)->i2sa_queue_end)
+#define	I2SA_QUEUE_FULL(i2sa) \
+	((((i2sa)->i2sa_queue_end + 1) % I2SA_QUEUE_DEPTH) == \
+	(i2sa)->i2sa_queue_start)
+
+
 extern size_t ikev2_sa_buckets;		/* Number of HASH buckets */
 
 ikev2_sa_t *ikev2_sa_get(uint64_t, uint64_t,
@@ -240,7 +243,6 @@ ikev2_sa_t *ikev2_sa_alloc(boolean_t, struct pkt_s *restrict,
     const struct sockaddr_storage *restrict,
     const struct sockaddr_storage *restrict);
 
-void	ikev2_sa_start_timer(ikev2_sa_t *);
 void	ikev2_sa_set_remote_spi(ikev2_sa_t *, uint64_t);
 void	ikev2_sa_free(ikev2_sa_t *);
 void	ikev2_sa_condemn(ikev2_sa_t *);

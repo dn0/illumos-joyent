@@ -132,6 +132,11 @@ int ss_bunyan(const struct sockaddr_storage *);
 uint32_t ss_port(const struct sockaddr_storage *);
 const void *ss_addr(const struct sockaddr_storage *);
 
+#define	BLOG_KEY_SRC		"src"
+#define	BLOG_KEY_SRCPORT	"srcport"
+#define	BLOG_KEY_DEST		"dest"
+#define	BLOG_KEY_DESTPORT	"destport"
+
 /* cstyle cannot handle ## __VA_ARGS */
 /* BEGIN CSTYLED */
 #define	STDERR(_lvl, _log, _msg, ...)			\
@@ -146,16 +151,16 @@ const void *ss_addr(const struct sockaddr_storage *);
 /* END CSTYLED */
 
 /* BEGIN CSTYLED */
-#define	NETLOG(_level, _log, _msg, _src, _dest, ...)	\
-	(void) bunyan_##_level((_log), (_msg),		\
-	BUNYAN_T_STRING, "func", __func__,		\
-	BUNYAN_T_STRING, "file", __FILE__,		\
-	BUNYAN_T_INT32, "line", __LINE__,		\
-	ss_bunyan(_src), "srcaddr", ss_addr(_src),	\
-	BUNYAN_T_UINT32, "srcport", ss_port(_src),	\
-	ss_bunyan(_dest), "destaddr", ss_addr(_dest),	\
-	BUNYAN_T_UINT32, "destport", ss_port(_dest),	\
-	## __VA_ARGS__,					\
+#define	NETLOG(_level, _log, _msg, _src, _dest, ...)		\
+	(void) bunyan_##_level((_log), (_msg),			\
+	BUNYAN_T_STRING, "func", __func__,			\
+	BUNYAN_T_STRING, "file", __FILE__,			\
+	BUNYAN_T_INT32, "line", __LINE__,			\
+	ss_bunyan(_src), BLOG_KEY_SRC, ss_addr(_src),		\
+	BUNYAN_T_UINT32, BLOG_KEY_SRCPORT, ss_port(_src),	\
+	ss_bunyan(_dest), BLOG_KEY_DEST, ss_addr(_dest),	\
+	BUNYAN_T_UINT32, BLOG_KEY_DESTPORT, ss_port(_dest),	\
+	## __VA_ARGS__,						\
 	BUNYAN_T_END)
 /* END CSTYLED */
 
@@ -174,7 +179,10 @@ bunyan_logfn_t getlog(bunyan_level_t);
 const char *afstr(sa_family_t);
 const char *symstr(void *);
 const char *event_str(event_t);
-const char *port_source_str(ushort_t);
+
+/* Size of largest possible port source string + NUL */
+#define	PORT_SOURCE_STR_LEN	20
+char *port_source_str(ushort_t, char *, size_t);
 
 #ifdef  __cplusplus
 }

@@ -28,22 +28,21 @@
  */
 
 #include <note.h>
+#include <libperiodic.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include "defs.h"
 #include "config.h"
+#include "defs.h"
+#include "fromto.h"
+#include "inbound.h"
 #include "ikev2_cookie.h"
 #include "ikev2_enum.h"
-#include "ikev2_sa.h"
 #include "ikev2_pkt.h"
-#include "worker.h"
-#include "inbound.h"
-#include "timer.h"
-#include "fromto.h"
 #include "ikev2_proto.h"
-#include "config.h"
+#include "ikev2_sa.h"
 #include "pkt.h"
+#include "worker.h"
 
 #define	SPILOG(_level, _log, _msg, _src, _dest, _lspi, _rspi, ...)	\
 	NETLOG(_level, _log, _msg, _src, _dest,				\
@@ -51,7 +50,7 @@
 	BUNYAN_T_UINT64, "remote_spi", (_rspi),				\
 	## __VA_ARGS__)
 
-static void ikev2_retransmit_cb(te_event_t, void *);
+static void ikev2_retransmit_cb(void *);
 static int select_socket(const ikev2_sa_t *);
 
 static ikev2_sa_t *ikev2_try_new_sa(pkt_t *restrict,
@@ -71,7 +70,9 @@ ikev2_dispatch(pkt_t *pkt, const struct sockaddr_storage *restrict src_addr,
 	uint64_t local_spi = INBOUND_LOCAL_SPI(hdr);
 	uint64_t remote_spi = INBOUND_REMOTE_SPI(hdr);
 
-	ikev2_pkt_log(pkt, log, BUNYAN_L_TRACE,
+	VERIFY(IS_WORKER);
+
+	ikev2_pkt_log(pkt, worker->w_log, BUNYAN_L_TRACE,
 	    "Looking for IKE SA for packet");
 
 	i2sa = ikev2_sa_get(local_spi, remote_spi, dest_addr, src_addr, pkt);
@@ -88,7 +89,7 @@ ikev2_dispatch(pkt_t *pkt, const struct sockaddr_storage *restrict src_addr,
 			 *
 			 * For now, discard.
 			 */
-			ikev2_pkt_log(pkt, log, BUNYAN_L_DEBUG,
+			ikev2_pkt_log(pkt, worker->w_log, BUNYAN_L_DEBUG,
 			    "Cannot find IKE SA for packet; discarding");
 			ikev2_pkt_free(pkt);
 			return;
@@ -99,15 +100,17 @@ ikev2_dispatch(pkt_t *pkt, const struct sockaddr_storage *restrict src_addr,
 		 * Discard for now.
 		 */
 		if (remote_spi == 0) {
-			ikev2_pkt_log(pkt, log, BUNYAN_L_DEBUG,
+			ikev2_pkt_log(pkt, worker->w_log, BUNYAN_L_DEBUG,
 			    "Received packet with a 0 remote SPI; discarding");
 			ikev2_pkt_free(pkt);
 			return;
 		}
 
 		i2sa = ikev2_try_new_sa(pkt, dest_addr, src_addr);
-		if (i2sa == NULL)
+		if (i2sa == NULL) {
+			ikev2_pkt_free(pkt);
 			return;
+		}
 	}
 
 	local_spi = I2SA_LOCAL_SPI(i2sa);
@@ -118,8 +121,10 @@ ikev2_dispatch(pkt_t *pkt, const struct sockaddr_storage *restrict src_addr,
 	 */
 	pkt->pkt_sa = i2sa;
 
+#if 0
 	if (worker_dispatch(WMSG_PACKET, pkt, local_spi % wk_nworkers))
 		return;
+#endif
 
 	SPILOG(info, log, "worker queue full; discarding packet",
 	    src_addr, dest_addr, local_spi, remote_spi);
@@ -128,7 +133,8 @@ ikev2_dispatch(pkt_t *pkt, const struct sockaddr_storage *restrict src_addr,
 
 /*
  * Determine if this pkt is an request for a new IKE SA.  If so, create
- * a larval IKE SA and return it, otherwise discard the packet.
+ * a larval IKE SA and return it, otherwise return NULL.  It is assumed
+ * caller will discard packet when NULL is returned.
  */
 static ikev2_sa_t *
 ikev2_try_new_sa(pkt_t *restrict pkt,
@@ -150,7 +156,7 @@ ikev2_try_new_sa(pkt_t *restrict pkt,
 	if (hdr->exch_type != IKEV2_EXCH_IKE_SA_INIT) {
 		errmsg = "Received a non-IKE_SA_INIT message with a local "
 		    "SPI of 0; discarding";
-		goto discard;
+		goto fail;
 	}
 
 	/*
@@ -159,7 +165,7 @@ ikev2_try_new_sa(pkt_t *restrict pkt,
 	if (hdr->msgid != 0) {
 		errmsg = "Received an IKE_SA_INIT message with a non-zero "
 		    "message id; discarding";
-		goto discard;
+		goto fail;
 	}
 
 	/*
@@ -167,7 +173,7 @@ ikev2_try_new_sa(pkt_t *restrict pkt,
 	 */
 	if ((hdr->flags & IKEV2_FLAG_INITIATOR) != hdr->flags) {
 		errmsg = "Invalid flags on packet; discarding";
-		goto discard;
+		goto fail;
 	}
 
 	/*
@@ -176,23 +182,22 @@ ikev2_try_new_sa(pkt_t *restrict pkt,
 	 */
 	if (!ikev2_cookie_check(pkt, r_addr)) {
 		errmsg = "Cookies missing or failed check; discarding";
-		goto discard;
+		goto fail;
 	}
 
 	/* otherwise create a larval SA */
 	i2sa = ikev2_sa_alloc(B_FALSE, pkt, l_addr, r_addr);
 	if (i2sa == NULL) {
 		errmsg = "Could not create larval IKEv2 SA; discarding";
-		goto discard;
+		goto fail;
 	}
 
 	return (i2sa);
 
-discard:
+fail:
 	if (errmsg != NULL)
 		ikev2_pkt_log(pkt, log, BUNYAN_L_DEBUG, errmsg);
 
-	ikev2_pkt_free(pkt);
 	return (NULL);
 }
 
@@ -224,7 +229,7 @@ ikev2_send(pkt_t *pkt, boolean_t is_error)
 		VERIFY3P(i2sa->last_sent, ==, NULL);
 
 	char *str = ikev2_pkt_desc(pkt);
-	bunyan_debug(i2sa->i2sa_log, "Sending packet",
+	(void) bunyan_debug(i2sa->i2sa_log, "Sending packet",
 	    BUNYAN_T_STRING, "pktdesc", str,
 	    BUNYAN_T_BOOLEAN, "response", resp,
 	    BUNYAN_T_UINT32, "nxmit", (uint32_t)pkt->pkt_xmit,
@@ -266,10 +271,14 @@ ikev2_send(pkt_t *pkt, boolean_t is_error)
 
 		mutex_enter(&i2sa->i2sa_lock);
 		i2sa->last_sent = pkt;
+		if (periodic_schedule(wk_periodic, retry, 0,
+		    ikev2_retransmit_cb, i2sa, &i2sa->i2sa_xmit_timer) != 0) {
+			/* XXX: msg */
+			mutex_exit(&i2sa->i2sa_lock);
+			return (B_FALSE);
+		}
 		mutex_exit(&i2sa->i2sa_lock);
 
-		(void) schedule_timeout(TE_TRANSMIT, ikev2_retransmit_cb, i2sa,
-		    retry, i2sa->i2sa_log);
 		return (B_TRUE);
 	}
 
@@ -295,9 +304,8 @@ ikev2_send(pkt_t *pkt, boolean_t is_error)
  * Retransmit callback
  */
 static void
-ikev2_retransmit_cb(te_event_t event, void *data)
+ikev2_retransmit_cb(void *data)
 {
-	NOTE(ARGUNUSED(event))
 	VERIFY(IS_WORKER);
 
 	ikev2_sa_t *sa = data;
@@ -344,9 +352,6 @@ ikev2_retransmit_cb(te_event_t event, void *data)
 	 */
 	(void) sendfromto(select_socket(sa), pkt_start(pkt), pkt_len(pkt),
 	    &sa->laddr, &sa->raddr);
-
-	VERIFY(schedule_timeout(TE_TRANSMIT, ikev2_retransmit_cb, sa, retry,
-	    sa->i2sa_log));
 }
 
 /*
@@ -381,8 +386,7 @@ ikev2_retransmit_check(pkt_t *pkt)
 		}
 
 		/* A response to our last message */
-		VERIFY3S(cancel_timeout(TE_TRANSMIT, sa,
-		    sa->i2sa_log), ==, 1);
+		VERIFY0(periodic_cancel(wk_periodic, sa->i2sa_xmit_timer));
 
 		/*
 		 * Corner case: this isn't the actual response in the
