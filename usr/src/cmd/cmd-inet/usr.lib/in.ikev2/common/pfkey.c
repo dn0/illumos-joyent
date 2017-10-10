@@ -295,9 +295,9 @@ pfkey_inbound(int s)
 
 	if (length == 0) {
 		bunyan_info(log, "ioctl: zero length message",
-		    BUNYAN_T_STRING, "func", __func__,
-		    BUNYAN_T_STRING, "file", __FILE__,
-		    BUNYAN_T_INT32, "line", __LINE__,
+		    BUNYAN_T_STRING, BLOG_KEY_FUNC, __func__,
+		    BUNYAN_T_STRING, BLOG_KEY_FILE, __FILE__,
+		    BUNYAN_T_INT32, BLOG_KEY_LINE, __LINE__,
 		    BUNYAN_T_END);
 		pfkey_arm(s);
 		return;

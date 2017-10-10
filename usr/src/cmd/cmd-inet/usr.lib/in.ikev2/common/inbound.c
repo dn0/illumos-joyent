@@ -114,7 +114,7 @@ inbound(int s)
 		pkt = ikev2_pkt_new_inbound(worker->w_buf, pktlen);
 		if (pkt == NULL)
 			return;
-		ikev2_dispatch(pkt, &from, &to);
+		ikev2_inbound(pkt, &from, &to);
 		return;
 	default:
 		bunyan_info(worker->w_log, "Unsupported ISAKMP/IKE version",
@@ -145,7 +145,7 @@ schedule_socket(int fd, void (*cb)(int))
 }
 
 static int
-udp_listener_socket(sa_family_t af, uint16_t port)
+udp_listener_socket(sa_family_t af, uint16_t port, boolean_t natt)
 {
 	struct sockaddr_storage storage = { 0 };
 	sockaddr_u_t sau = { .sau_ss = &storage };
@@ -153,6 +153,9 @@ udp_listener_socket(sa_family_t af, uint16_t port)
 	int sock = -1;
 	int yes = 1;
 	ipsec_req_t ipsr = { 0 };
+
+	/* natt can only be true for AF_INET sockets */
+	VERIFY(af == AF_INET || !natt);
 
 	ipsr.ipsr_ah_req = ipsr.ipsr_esp_req = IPSEC_PREF_NEVER;
 
@@ -173,12 +176,6 @@ udp_listener_socket(sa_family_t af, uint16_t port)
 		    BUNYAN_T_END);
 		exit(EXIT_FAILURE);
 	}
-
-	(void) bunyan_trace(log, "UDP socket created",
-	    BUNYAN_T_INT32, "fd", (int32_t)sock,
-	    BUNYAN_T_STRING, "af", afstr(af),
-	    BUNYAN_T_UINT32, "port", (uint32_t)port,
-	    BUNYAN_T_END);
 
 	sau.sau_ss->ss_family = af;
 	/* Exploit that sin_port and sin6_port live at the same offset. */
@@ -221,7 +218,7 @@ udp_listener_socket(sa_family_t af, uint16_t port)
 	}
 
 	/* Setup IPv4 NAT Traversal */
-	if (af == AF_INET && port == IPPORT_IKE_NATT) {
+	if (natt) {
 		int nat_t = 1;
 
 		if (setsockopt(sock, IPPROTO_UDP, UDP_NAT_T_ENDPOINT,
@@ -230,15 +227,22 @@ udp_listener_socket(sa_family_t af, uint16_t port)
 			    "UDP_NAT_T_ENDPOINT", __func__);
 	}
 
+	(void) bunyan_trace(log, "UDP socket created",
+	    BUNYAN_T_INT32, "fd", (int32_t)sock,
+	    BUNYAN_T_STRING, "af", afstr(af),
+	    BUNYAN_T_UINT32, "port", (uint32_t)port,
+	    BUNYAN_T_BOOLEAN, "natt", natt,
+	    BUNYAN_T_END);
+
 	return (sock);
 }
 
 void
 inbound_init(void)
 {
-	ikesock4 = udp_listener_socket(AF_INET, IPPORT_IKE);
-	nattsock = udp_listener_socket(AF_INET, IPPORT_IKE_NATT);
-	ikesock6 = udp_listener_socket(AF_INET6, IPPORT_IKE);
+	ikesock4 = udp_listener_socket(AF_INET, IPPORT_IKE, B_FALSE);
+	nattsock = udp_listener_socket(AF_INET, IPPORT_IKE_NATT, B_TRUE);
+	ikesock6 = udp_listener_socket(AF_INET6, IPPORT_IKE, B_FALSE);
 
 	schedule_socket(ikesock4, inbound);
 	schedule_socket(nattsock, inbound);

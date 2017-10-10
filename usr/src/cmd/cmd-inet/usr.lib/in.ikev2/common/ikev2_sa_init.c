@@ -47,6 +47,9 @@ static boolean_t ikev2_sa_keygen(ikev2_sa_result_t *restrict, pkt_t *restrict,
 void
 ikev2_sa_init_inbound(pkt_t *pkt)
 {
+	VERIFY(IS_WORKER);
+	VERIFY(MUTEX_HELD(&pkt->pkt_sa->i2sa_lock));
+
 	if (pkt_header(pkt)->flags & IKEV2_FLAG_INITIATOR)
 		ikev2_sa_init_inbound_init(pkt);
 	else

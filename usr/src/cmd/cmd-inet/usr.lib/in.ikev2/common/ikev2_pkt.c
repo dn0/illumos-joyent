@@ -52,7 +52,8 @@ ikev2_pkt_new_exchange(ikev2_sa_t *i2sa, ikev2_exch_t exch_type)
 	uint32_t msgid = 0;
 	uint8_t flags = 0;
 
-	mutex_enter(&i2sa->i2sa_lock);
+	VERIFY(MUTEX_HELD(&i2sa->i2sa_lock));
+
 	if (exch_type != IKEV2_EXCH_IKE_SA_INIT)
 		msgid = i2sa->outmsgid++;
 
@@ -66,11 +67,8 @@ ikev2_pkt_new_exchange(ikev2_sa_t *i2sa, ikev2_exch_t exch_type)
 
 	if (pkt == NULL) {
 		i2sa->outmsgid--;
-		mutex_exit(&i2sa->i2sa_lock);
 		return (NULL);
 	}
-
-	mutex_exit(&i2sa->i2sa_lock);
 
 	pkt->pkt_sa = i2sa;
 	I2SA_REFHOLD(i2sa);
@@ -85,7 +83,9 @@ ikev2_pkt_new_response(const pkt_t *init)
 	ike_header_t *hdr = pkt_header(init);
 	uint8_t flags = IKEV2_FLAG_RESPONSE;
 
-	ASSERT(PKT_IS_V2(init));
+	VERIFY3U(IKE_GET_MAJORV(hdr->version), ==,
+	    IKE_GET_MAJORV(IKEV2_VERSION));
+	VERIFY(MUTEX_HELD(&init->pkt_sa->i2sa_lock));
 
 	if (init->pkt_sa->flags & I2SA_INITIATOR)
 		flags |= IKEV2_FLAG_INITIATOR;
@@ -118,7 +118,7 @@ ikev2_pkt_new_inbound(void *restrict buf, size_t buflen)
 	(void) bunyan_trace(worker->w_log, "Creating new inbound IKEV2 packet",
 	    BUNYAN_T_END);
 
-	ASSERT(IS_P2ALIGNED(buf, sizeof (uint64_t)));
+	VERIFY(IS_P2ALIGNED(buf, sizeof (uint64_t)));
 
 	hdr = (const ike_header_t *)buf;
 
@@ -972,6 +972,9 @@ ikev2_pkt_encryptdecrypt(pkt_t *pkt, boolean_t encrypt)
 	CK_RV rc = CKR_OK;
 	encr_modes_t mode = encr_data[sa->encr].ed_mode;
 	uint8_t padlen = 0;
+
+	VERIFY(IS_WORKER);
+	VERIFY(MUTEX_HELD(&sa->i2sa_lock));
 
 	if (sa->flags & I2SA_INITIATOR) {
 		key = sa->sk_ei;

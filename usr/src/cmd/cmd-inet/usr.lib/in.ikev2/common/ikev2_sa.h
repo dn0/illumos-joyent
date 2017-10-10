@@ -66,18 +66,17 @@ typedef enum i2sa_hash_e {
 } i2sa_hash_t;
 #define	I2SA_NUM_HASH	2	/* The number of IKEv2 SA hashes we have */
 
-#define	I2SA_SALT_LEN	(32)	/* Maximum size of salt, may be smaller */
+#define	I2SA_SALT_LEN		32	/* Max size of salt, may be smaller */
+#define	I2SA_QUEUE_DEPTH	8	/* How many packets we'll queue */
 
-/*
- * Which state the IKEv2 SA can be in.  Currently there are just two, but
- * it is expected this will grow.
- */
-typedef enum ikev2_sa_state {
-	IKEV2_SA_IDLE,
-	IKEV2_SA_BUSY,
-} ikev2_sa_state_t;
+typedef enum i2sa_evt {
+	I2SA_EVT_NONE		= 0x00,
+	I2SA_EVT_PKT_XMIT	= 0x01,
+	I2SA_EVT_P1_EXPIRE	= 0x02,
+	I2SA_EVT_SOFT_EXPIRE	= 0x04,
+	I2SA_EVT_HARD_EXPIRE	= 0x08,
+} i2sa_evt_t;
 
-#define	IKEV2_SA_QUEUE_DEPTH	16
 /*
  * The IKEv2 SA.
  *
@@ -85,25 +84,34 @@ typedef enum ikev2_sa_state {
  * reference-counted node, where the lookup key is either the local
  * SPI/cookie, or a hash based on the remote address and remote SPI.  (See
  * ikev2_pkt.h for the _SPI() macros.)  It should be allocated with a umem
- * cache.  It contains a mutex to lock certain fields if need be.
+ * cache.
  *
  * Because of the distinct sets of lookup keys, it requires two linkages.
  */
 struct ikev2_sa_s {
-				/* protects i2sa_state and i2sa_tid */
-	mutex_t			i2sa_state_lock;
-	ikev2_sa_state_t	i2sa_state;
-	thread_t		i2sa_tid;	/* set when active */
+			/*
+			 * Logger for this IKEv2 SA.  Set at creation time.
+			 * Nothing should add or remove keys to this.  Can
+			 * be used by any refheld pointer to the SA without
+			 * acquiring i2sa_lock.
+			 */
+	bunyan_logger_t	*i2sa_log;
+
+			/* Protects queue and events field */
+	mutex_t		i2sa_queue_lock;
+	struct pkt_s	*i2sa_queue[I2SA_QUEUE_DEPTH];
+	size_t		i2sa_queue_start;
+	size_t		i2sa_queue_end;
+	i2sa_evt_t	i2sa_events;
 
 			/*
 			 * protects everything else, acquire after
-			 * i2sa_state_lock
+			 * i2sa_queue_lock
 			 */
 	mutex_t		i2sa_lock;
+	thread_t	i2sa_tid;	/* active tid */
 	list_node_t	i2sa_lspi_node;
 	list_node_t	i2sa_rspi_node;
-
-	bunyan_logger_t	*i2sa_log;
 
 			/* Link to the bucket we are in for each hash */
 	i2sa_bucket_t	*bucket[I2SA_NUM_HASH];
@@ -118,19 +126,16 @@ struct ikev2_sa_s {
 	struct sockaddr_storage laddr;  /* Local address & port. */
 	struct sockaddr_storage raddr;  /* Remote address & port. */
 
-				/*
-				 * What IKEv2 daemon are we talking to.
-				 * Currently it is just used to determine if
-				 * we can validate padding in SK payloads.
-				 * If there are any additional custom behaviors
-				 * we want to support in the future, this
-				 * will probably need to evolve into
-				 * feature flags or such.
-				 */
-	vendor_t		vendor;
-
-	/* Current number of outstanding messages prior to outmsgid. */
-	int		msgwin;
+			/*
+			 * What IKEv2 daemon are we talking to.
+			 * Currently it is just used to determine if
+			 * we can validate padding in SK payloads.
+			 * If there are any additional custom behaviors
+			 * we want to support in the future, this
+			 * will probably need to evolve into
+			 * feature flags or such.
+			 */
+	vendor_t	vendor;
 
 	ikev2_xf_encr_t	encr;		/* Encryption algorithm */
 	size_t		encr_key_len;	/* Key length (bytes) for encr */
@@ -138,9 +143,12 @@ struct ikev2_sa_s {
 	ikev2_prf_t	prf;		/* PRF algorithm */
 	ikev2_dh_t	dhgrp;		/* Diffie-Hellman group. */
 
+	/* Current number of outstanding messages prior to outmsgid. */
+	int		msgwin;
 	uint32_t	outmsgid;	/* Next msgid for outbound packets. */
 	uint32_t	inmsgid;	/* Next expected inbound msgid. */
 
+	periodic_id_t	i2sa_xmit_timer;
 	struct pkt_s	*init_i;  	/* IKE_SA_INIT packet. */
 	struct pkt_s	*init_r;
 	struct pkt_s	*last_resp_sent;
@@ -149,9 +157,11 @@ struct ikev2_sa_s {
 
 	time_t		birth;		/* When was AUTH completed */
 	hrtime_t	softexpire;
+	periodic_id_t	i2sa_softlife_timer;
 	hrtime_t	hardexpire;
+	periodic_id_t	i2sa_hardlife_timer;
 
-	ikev2_child_sa_t	*child_sas;
+	list_t		i2sa_child_sas;
 
 	CK_OBJECT_HANDLE dh_pubkey;
 	CK_OBJECT_HANDLE dh_privkey;
@@ -169,28 +179,23 @@ struct ikev2_sa_s {
 	uint8_t		salt_r[I2SA_SALT_LEN];
 	size_t		saltlen;
 
-	periodic_id_t		i2sa_xmit_timer;
 	periodic_id_t		i2sa_p1_timer;
-	periodic_id_t		i2sa_softlife_timer;
-	periodic_id_t		i2sa_hardlife_timer;
-
-	mutex_t			i2sa_queue_lock;
-	struct pkt_s		*i2sa_queue[IKEV2_SA_QUEUE_DEPTH];
-	size_t			i2sa_queue_start;
-	size_t			i2sa_queue_end;
 };
 
 struct ikev2_child_sa {
-	ikev2_child_sa_t	*next;
+	list_node_t		i2c_node;
+
+	hrtime_t		i2c_birth;
 	ikev2_spi_proto_t	i2c_satype;
 	uint32_t		i2c_spi;
 
-	/* Nonces */
-	uint8_t			i2c_ni[IKEV2_NONCE_MAX];
-	size_t			i2c_nilen;
-	uint8_t			i2c_nr[IKEV2_NONCE_MAX];
-	size_t			i2c_nrlen;
-	/* XXX: more to come probably */
+	/*A subset of the child SAs state duplicated for observability */
+	ikev2_xf_encr_t		i2c_encr;
+	size_t			i2c_encr_key_len;
+	ikev2_xf_auth_t		i2c_auth;
+	ikev2_dh_t		i2c_dh;
+
+	/* XXX: More to come.  Traffic selectors perhaps? */
 };
 
 /* SA flags */
@@ -199,9 +204,6 @@ struct ikev2_child_sa {
 #define	I2SA_NAT_REMOTE		0x4	/* My peer is behind a NAT. */
 #define	I2SA_CONDEMNED		0x8	/* SA is unlinked from a tree. */
 #define	I2SA_AUTHENTICATED	0x10	/* SA has been authenticated */
-#define	I2SA_P1_EXPIRE		0x20	/* P1 expire timer has fired */
-#define	I2SA_SOFT_EXPIRE	0x40	/* Soft lifetime has fired */
-#define	I2SA_HARD_EXPIRE	0x80	/* Hard lifetime has fired */
 
 #define	I2SA_LOCAL_SPI(i2sa) \
 	(((i2sa)->flags & I2SA_INITIATOR) ? (i2sa)->i_spi : \
@@ -246,6 +248,7 @@ ikev2_sa_t *ikev2_sa_alloc(boolean_t, struct pkt_s *restrict,
 void	ikev2_sa_set_remote_spi(ikev2_sa_t *, uint64_t);
 void	ikev2_sa_free(ikev2_sa_t *);
 void	ikev2_sa_condemn(ikev2_sa_t *);
+void	ikev2_sa_p1_expire(ikev2_sa_t *);
 
 void	ikev2_sa_flush(void);
 void	ikev2_sa_set_hashsize(uint_t);

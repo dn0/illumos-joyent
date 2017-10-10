@@ -59,10 +59,10 @@ static ikev2_sa_t *ikev2_try_new_sa(pkt_t *restrict,
 
 /*
  * Find the IKEv2 SA for a given inbound packet (or create a new one if
- * an IKE_SA_INIT exchange) and send packet to worker.
+ * an IKE_SA_INIT exchange) and either process or add to the IKEv2 SA queue.
  */
 void
-ikev2_dispatch(pkt_t *pkt, const struct sockaddr_storage *restrict src_addr,
+ikev2_inbound(pkt_t *pkt, const struct sockaddr_storage *restrict src_addr,
     const struct sockaddr_storage *restrict dest_addr)
 {
 	ikev2_sa_t *i2sa = NULL;
@@ -73,7 +73,7 @@ ikev2_dispatch(pkt_t *pkt, const struct sockaddr_storage *restrict src_addr,
 	VERIFY(IS_WORKER);
 
 	ikev2_pkt_log(pkt, worker->w_log, BUNYAN_L_TRACE,
-	    "Looking for IKE SA for packet");
+	    "Received packet");
 
 	i2sa = ikev2_sa_get(local_spi, remote_spi, dest_addr, src_addr, pkt);
 	if (i2sa == NULL) {
@@ -121,14 +121,21 @@ ikev2_dispatch(pkt_t *pkt, const struct sockaddr_storage *restrict src_addr,
 	 */
 	pkt->pkt_sa = i2sa;
 
-#if 0
-	if (worker_dispatch(WMSG_PACKET, pkt, local_spi % wk_nworkers))
+	/* Enqueue packet and attempt to dispatch */
+	mutex_enter(&i2sa->i2sa_queue_lock);
+	if (I2SA_QUEUE_FULL(i2sa)) {
+		(void) bunyan_info(i2sa->i2sa_log,
+		    "queue full; discarding packet",
+		    BUNYAN_T_POINTER, "pkt", pkt, BUNYAN_T_END);
+		mutex_exit(&i2sa->i2sa_queue_lock);
+		ikev2_pkt_free(pkt);
 		return;
-#endif
+	}
 
-	SPILOG(info, log, "worker queue full; discarding packet",
-	    src_addr, dest_addr, local_spi, remote_spi);
-	ikev2_pkt_free(pkt);
+	i2sa->i2sa_queue[i2sa->i2sa_queue_start++] = pkt;
+	i2sa->i2sa_queue_start %= I2SA_QUEUE_DEPTH;
+	ikev2_dispatch(i2sa);
+	mutex_exit(&i2sa->i2sa_queue_lock);
 }
 
 /*
@@ -208,13 +215,14 @@ fail:
 boolean_t
 ikev2_send(pkt_t *pkt, boolean_t is_error)
 {
-	VERIFY(IS_WORKER);
-
 	ikev2_sa_t *i2sa = pkt->pkt_sa;
 	ike_header_t *hdr = pkt_header(pkt);
 	ssize_t len = 0;
 	int s = -1;
 	boolean_t resp = !!(hdr->flags & IKEV2_FLAG_RESPONSE);
+
+	VERIFY(IS_WORKER);
+	VERIFY(MUTEX_HELD(&i2sa->i2sa_lock));
 
 	if (!ikev2_pkt_done(pkt)) {
 		ikev2_pkt_free(pkt);
@@ -269,16 +277,12 @@ ikev2_send(pkt_t *pkt, boolean_t is_error)
 
 		CONFIG_REFRELE(cfg);
 
-		mutex_enter(&i2sa->i2sa_lock);
 		i2sa->last_sent = pkt;
 		if (periodic_schedule(wk_periodic, retry, 0,
 		    ikev2_retransmit_cb, i2sa, &i2sa->i2sa_xmit_timer) != 0) {
 			/* XXX: msg */
-			mutex_exit(&i2sa->i2sa_lock);
 			return (B_FALSE);
 		}
-		mutex_exit(&i2sa->i2sa_lock);
-
 		return (B_TRUE);
 	}
 
@@ -292,16 +296,15 @@ ikev2_send(pkt_t *pkt, boolean_t is_error)
 	 */
 	if (hdr->exch_type != IKEV2_EXCH_IKE_SA_INIT ||
 	    hdr->responder_spi != 0) {
-		mutex_enter(&i2sa->i2sa_lock);
 		i2sa->last_resp_sent = pkt;
-		mutex_exit(&i2sa->i2sa_lock);
 	}
 
 	return (B_TRUE);
 }
 
 /*
- * Retransmit callback
+ * Trigger a resend of our last request due to timeout waiting for a
+ * response.
  */
 static void
 ikev2_retransmit_cb(void *data)
@@ -309,21 +312,37 @@ ikev2_retransmit_cb(void *data)
 	VERIFY(IS_WORKER);
 
 	ikev2_sa_t *sa = data;
+
+	mutex_enter(&sa->i2sa_queue_lock);
+	sa->i2sa_events |= I2SA_EVT_PKT_XMIT;
+	ikev2_dispatch(sa);
+	mutex_exit(&sa->i2sa_queue_lock);
+}
+
+/*
+ * Resend our last request.
+ */
+static void
+ikev2_retransmit(ikev2_sa_t *sa)
+{
+	VERIFY(IS_WORKER);
+
 	pkt_t *pkt = sa->last_sent;
 	ike_header_t *hdr = pkt_header(pkt);
 	hrtime_t retry = 0, retry_init = 0, retry_max = 0;
 	size_t limit = 0;
 
-	mutex_enter(&sa->i2sa_lock);
+	VERIFY(MUTEX_HELD(&sa->i2sa_lock));
+
+	if (sa->flags & I2SA_CONDEMNED)
+		return;
 
 	/* XXX: what about condemned SAs */
 	if (sa->outmsgid > ntohl(hdr->msgid) || sa->last_sent == NULL) {
 		/* already acknowledged */
-		mutex_exit(&sa->i2sa_lock);
 		ikev2_pkt_free(pkt);
 		return;
 	}
-	mutex_exit(&sa->i2sa_lock);
 
 	config_t *cfg = config_get();
 	retry_init = cfg->cfg_retry_init;
@@ -346,17 +365,18 @@ ikev2_retransmit_cb(void *data)
 	ikev2_pkt_log(pkt, sa->i2sa_log, BUNYAN_L_DEBUG, "Sending packet");
 
 	/*
-	 * If sendfromto() errors, it will log the error, but being a
-	 * retransmit callback, there's not much more we can do here, so
-	 * just ignore the return value.
+	 * If sendfromto() errors, it will log the error, however there's not
+	 * much that can be done if it fails, other than just wait to try
+	 * again, so we ignore the return value.
 	 */
 	(void) sendfromto(select_socket(sa), pkt_start(pkt), pkt_len(pkt),
 	    &sa->laddr, &sa->raddr);
 }
 
 /*
- * Determine if packet is a retransmit, if so, retransmit our last
- * response and discard.  Otherwise return B_FALSE and continue processing.
+ * Determine if inbound packet is a retransmit. If so, retransmit our last
+ * response and discard pkt.  Otherwise return B_FALSE to allow processing to
+ * continue.
  *
  * XXX better function name?
  */
@@ -368,7 +388,8 @@ ikev2_retransmit_check(pkt_t *pkt)
 	uint32_t msgid = ntohl(hdr->msgid);
 	boolean_t discard = B_TRUE;
 
-	mutex_enter(&sa->i2sa_lock);
+	VERIFY(MUTEX_HELD(&sa->i2sa_lock));
+
 	if (sa->flags & I2SA_CONDEMNED)
 		goto done;
 
@@ -445,49 +466,129 @@ ikev2_retransmit_check(pkt_t *pkt)
 	discard = B_FALSE;
 
 done:
-	mutex_exit(&sa->i2sa_lock);
 	return (discard);
 }
 
 /*
- * Worker inbound function -- handle retransmits or do processing for
- * the given message exchange type;
+ * Dispatches any queued events and packets.  Must be called with
+ * sa->i2sa_queue_lock held.  This is structured so that the first thread
+ * that successfully acquires an IKEv2 that isn't currently in use on other
+ * workers will pin it (by setting i2sa->i2sa_tid) to that worker until
+ * all the pending events and packets have been processed.
  */
 void
-ikev2_inbound(pkt_t *pkt)
+ikev2_dispatch(ikev2_sa_t *sa)
 {
 	VERIFY(IS_WORKER);
+	int rc;
 
-	(void) bunyan_trace(worker->w_log, "Starting IKEV2 inbound processing",
-	    BUNYAN_T_END);
+	VERIFY(MUTEX_HELD(&sa->i2sa_queue_lock));
 
-	if (ikev2_retransmit_check(pkt)) {
-		ikev2_pkt_free(pkt);
+	/*
+	 * Since the first thread that acquires i2sa_lock for this SA will
+	 * pin it (by setting i2sa_tid to it's tid while holding i2sa_lock),
+	 * if we cannot acquire the lock immedately, we know another thread
+	 * has already pinned this IKEv2 SA for the moment and don't need
+	 * to wait.
+	 */
+	switch ((rc = mutex_trylock(&sa->i2sa_lock))) {
+	case 0:
+		if (sa->i2sa_tid != 0 && sa->i2sa_tid != thr_self()) {
+			/*
+			 * Snuck in between runs of this loop on another
+			 * thread.  Let the other thread process everything.
+			 */
+			mutex_exit(&sa->i2sa_lock);
+			return;
+		}
+		break;
+	case EBUSY:
 		return;
-	}
-
-	/* XXX: Might this log msg be better in ikev2_dispatch() instead? */
-	ikev2_pkt_log(pkt, pkt->pkt_sa->i2sa_log, BUNYAN_L_DEBUG,
-	    "Received packet");
-
-	switch (pkt_header(pkt)->exch_type) {
-	case IKEV2_EXCH_IKE_SA_INIT:
-		ikev2_sa_init_inbound(pkt);
-		break;
-	case IKEV2_EXCH_IKE_AUTH:
-	case IKEV2_EXCH_CREATE_CHILD_SA:
-	case IKEV2_EXCH_INFORMATIONAL:
-	case IKEV2_EXCH_IKE_SESSION_RESUME:
-		/* TODO */
-		ikev2_pkt_log(pkt, pkt->pkt_sa->i2sa_log, BUNYAN_L_INFO,
-		    "Exchange not implemented yet");
-		ikev2_pkt_free(pkt);
-		break;
 	default:
-		ikev2_pkt_log(pkt, pkt->pkt_sa->i2sa_log, BUNYAN_L_ERROR,
-		    "Unknown IKEv2 exchange");
-		ikev2_pkt_free(pkt);
+		TSTDERR(rc, fatal, sa->i2sa_log,
+		    "Unexpected mutex_tryenter() failure");
+		abort();
 	}
+	sa->i2sa_tid = thr_self();
+
+	while (sa->i2sa_events != 0 || !I2SA_QUEUE_EMPTY(sa)) {
+		pkt_t *pkt = NULL;
+
+		/*
+		 * Check if any events have fired.  We start with the things
+		 * that would lead to the destruction of the IKEV2 SA --
+		 * that we we don't (for example) try to retransmit from
+		 * a condemned IKEv2 SA.
+		 */
+		if (sa->i2sa_events & I2SA_EVT_P1_EXPIRE) {
+			sa->i2sa_events &= ~(I2SA_EVT_P1_EXPIRE);
+			ikev2_sa_p1_expire(sa);
+		}
+		if (sa->i2sa_events & I2SA_EVT_HARD_EXPIRE) {
+			sa->i2sa_events &= ~(I2SA_EVT_HARD_EXPIRE);
+			/* TODO: ikev2_sa_hard_expire(sa); */
+		}
+		if (sa->i2sa_events & I2SA_EVT_SOFT_EXPIRE) {
+			sa->i2sa_events &= ~(I2SA_EVT_SOFT_EXPIRE);
+			/* TODO: ikev2_sa_soft_expire(sa); */
+		}
+		if (sa->i2sa_events & I2SA_EVT_PKT_XMIT) {
+			sa->i2sa_events &= ~(I2SA_EVT_PKT_XMIT);
+			ikev2_retransmit(sa);
+		}
+
+		if (I2SA_QUEUE_EMPTY(sa))
+			break;
+
+		/* Pick off a packet and release the queue */
+		pkt = sa->i2sa_queue[sa->i2sa_queue_end];
+		sa->i2sa_queue[sa->i2sa_queue_end++] = NULL;
+		sa->i2sa_queue_end %= I2SA_QUEUE_DEPTH;
+		mutex_exit(&sa->i2sa_queue_lock);
+
+		if (ikev2_retransmit_check(pkt)) {
+			ikev2_pkt_free(pkt);
+			mutex_exit(&sa->i2sa_lock);
+			mutex_enter(&sa->i2sa_queue_lock);
+			mutex_enter(&sa->i2sa_lock);
+			continue;
+		}
+
+		switch (pkt_header(pkt)->exch_type) {
+		case IKEV2_EXCH_IKE_SA_INIT:
+			ikev2_sa_init_inbound(pkt);
+			break;
+		case IKEV2_EXCH_IKE_AUTH:
+		case IKEV2_EXCH_CREATE_CHILD_SA:
+		case IKEV2_EXCH_INFORMATIONAL:
+		case IKEV2_EXCH_IKE_SESSION_RESUME:
+			/* TODO */
+			ikev2_pkt_log(pkt, sa->i2sa_log, BUNYAN_L_INFO,
+			    "Exchange not implemented yet");
+			ikev2_pkt_free(pkt);
+			break;
+		default:
+			ikev2_pkt_log(pkt, sa->i2sa_log,
+			    BUNYAN_L_ERROR, "Unknown IKEv2 exchange");
+			ikev2_pkt_free(pkt);
+		}
+
+		mutex_exit(&sa->i2sa_lock);
+		mutex_enter(&sa->i2sa_queue_lock);
+		mutex_enter(&sa->i2sa_lock);
+	}
+
+	VERIFY(MUTEX_HELD(&sa->i2sa_lock));
+	VERIFY(MUTEX_HELD(&sa->i2sa_queue_lock));
+
+	/* We're done for now, release IKEv2 SA for use with other threads */
+	sa->i2sa_tid = 0;
+	mutex_exit(&sa->i2sa_lock);
+
+	/*
+	 * We enter with i2sa->i2sa_queue_lock held, exit with it held
+	 * as well
+	 */
 }
 
 static int

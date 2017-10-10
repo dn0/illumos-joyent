@@ -28,10 +28,10 @@ struct pkt_s;
 struct ikev2_sa_s;
 struct sockaddr_storage;
 
-void ikev2_dispatch(struct pkt_s *, const struct sockaddr_storage *,
+void ikev2_inbound(struct pkt_s *, const struct sockaddr_storage *,
     const struct sockaddr_storage *);
 boolean_t ikev2_send(struct pkt_s *, boolean_t);
-void ikev2_inbound(struct pkt_s *);
+void ikev2_dispatch(struct ikev2_sa_s *);
 
 void ikev2_sa_init_inbound(struct pkt_s *);
 void ikev2_sa_init_outbound(struct ikev2_sa_s *restrict, uint8_t *restrict,

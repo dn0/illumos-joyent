@@ -137,25 +137,35 @@ const void *ss_addr(const struct sockaddr_storage *);
 #define	BLOG_KEY_DEST		"dest"
 #define	BLOG_KEY_DESTPORT	"destport"
 
+#define	BLOG_KEY_ERRMSG		"err"
+#define	BLOG_KEY_ERRNO		"errno"
+#define	BLOG_KEY_FILE		"file"
+#define	BLOG_KEY_FUNC		"func"
+#define	BLOG_KEY_LINE		"line"
+
 /* cstyle cannot handle ## __VA_ARGS */
 /* BEGIN CSTYLED */
-#define	STDERR(_lvl, _log, _msg, ...)			\
-	(void) bunyan_##_lvl((_log), (_msg),		\
-	BUNYAN_T_STRING, "err", strerror(errno),	\
-	BUNYAN_T_INT32, "errno", (int32_t)(errno),	\
-	BUNYAN_T_STRING, "func", __func__,		\
-	BUNYAN_T_STRING, "file", __FILE__,		\
-	BUNYAN_T_INT32, "line", __LINE__,		\
-	## __VA_ARGS__,					\
+#define	TSTDERR(_e, _lvl, _log, _msg, ...)			\
+	(void) bunyan_##_lvl((_log), (_msg),			\
+	BUNYAN_T_STRING, BLOG_KEY_ERRMSG, strerror(_e),		\
+	BUNYAN_T_INT32, BLOG_KEY_ERRNO, (int32_t)(_e),		\
+	BUNYAN_T_STRING, BLOG_KEY_FUNC, __func__,		\
+	BUNYAN_T_STRING, BLOG_KEY_FILE, __FILE__,		\
+	BUNYAN_T_INT32, BLOG_KEY_LINE, __LINE__,		\
+	## __VA_ARGS__,						\
 	BUNYAN_T_END)
+
+#define	STDERR(_lvl, _log, _msg, ...) \
+	TSTDERR(errno, _lvl, _log, _msg, ## __VA_ARGS__)
+
 /* END CSTYLED */
 
 /* BEGIN CSTYLED */
 #define	NETLOG(_level, _log, _msg, _src, _dest, ...)		\
 	(void) bunyan_##_level((_log), (_msg),			\
-	BUNYAN_T_STRING, "func", __func__,			\
-	BUNYAN_T_STRING, "file", __FILE__,			\
-	BUNYAN_T_INT32, "line", __LINE__,			\
+	BUNYAN_T_STRING, BLOG_KEY_FUNC, __func__,		\
+	BUNYAN_T_STRING, BLOG_KEY_FILE, __FILE__,		\
+	BUNYAN_T_INT32, BLOG_KEY_LINE, __LINE__,		\
 	ss_bunyan(_src), BLOG_KEY_SRC, ss_addr(_src),		\
 	BUNYAN_T_UINT32, BLOG_KEY_SRCPORT, ss_port(_src),	\
 	ss_bunyan(_dest), BLOG_KEY_DEST, ss_addr(_dest),	\

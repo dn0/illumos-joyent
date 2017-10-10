@@ -211,9 +211,9 @@ sendfromto(int s, const uint8_t *restrict buf, size_t buflen,
 
 	if (src->ss_family != AF_INET && src->ss_family != AF_INET6) {
 		(void) bunyan_error(log, "Unsupported address family",
-		    BUNYAN_T_STRING, "func", __func__,
-		    BUNYAN_T_STRING, "file", __FILE__,
-		    BUNYAN_T_INT32, "line", __LINE__,
+		    BUNYAN_T_STRING, BLOG_KEY_FUNC, __func__,
+		    BUNYAN_T_STRING, BLOG_KEY_FILE, __FILE__,
+		    BUNYAN_T_INT32, BLOG_KEY_LINE, __LINE__,
 		    BUNYAN_T_UINT32, "af", (uint32_t)src->ss_family,
 		    BUNYAN_T_END);
 		errno = EAFNOSUPPORT;

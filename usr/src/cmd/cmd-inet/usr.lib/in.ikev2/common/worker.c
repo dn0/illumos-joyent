@@ -33,21 +33,7 @@
 #include "worker.h"
 
 /*
- * Workers handle all the heavy lifting (including crypto) in in.ikev2d.
- * An event port (port) waits for packets from our UDP sockets (IPv4, IPv6,
- * and IPv4 NAT) as well as for pfkey messages.  For UDP messages, some
- * minimal sanity checks (such as verifying payload lengths) occur, an IKEv2
- * SA is located for the message (or if appropriate, a larval IKEv2 SA is
- * created), and then the packet is handed off to a worker thread to do the
- * rest of the work.  Currently dispatching works by merely taking the local
- * IKEv2 SA SPI modulo the number of worker threads.  Since we control
- * the local IKEv2 SA SPI value (and is randomly chosen), this should prevent
- * a single connection from saturating the process by making all IKEv2
- * processing for a given IKEv2 SA occur all within the same thread (it also
- * simplifies some of the synchronization requirements for manipulating
- * IKEv2 SAs).  Obviously this does not address a DOS with spoofed source
- * addresses.  Cookies are used to mitigate such threats (to the extent it
- * can by dropping inbound packets without valid cookie values when enabled).
+ * Workers handle the bulk of the IKE processing.
  */
 
 typedef enum worker_state {
@@ -159,23 +145,11 @@ again:
 	case EAGAIN:
 		goto again;
 	case ENOMEM:
-		(void) bunyan_warn(log,
-		    "No memory to create worker",
-		    BUNYAN_T_STRING, "errmsg", strerror(rc),
-		    BUNYAN_T_INT32, "errno", (int32_t)rc,
-		    BUNYAN_T_STRING, "file", __FILE__,
-		    BUNYAN_T_INT32, "line", (int32_t)__LINE__,
-		    BUNYAN_T_STRING, "func", __func__,
-		    BUNYAN_T_END);
+		TSTDERR(rc, warn, log, "No memory to create worker");
 		goto fail;
 	default:
-		(void) bunyan_fatal(log,
-		    "Cannot create additional worker thread",
-		    BUNYAN_T_STRING, "errmsg", strerror(rc),
-		    BUNYAN_T_INT32, "errno", (int32_t)rc,
-		    BUNYAN_T_STRING, "file", __FILE__,
-		    BUNYAN_T_INT32, "line", (int32_t)__LINE__,
-		    BUNYAN_T_END);
+		TSTDERR(rc, fatal, log,
+		    "Cannot create additional worker thread");
 		abort();
 	}
 
@@ -345,7 +319,7 @@ worker_main(void *arg)
 
 		/*
 		 * Inbound processing will set these for the packet processing
-		 * as it works it's way through processing, so clear these
+		 * as it works it's way through, so clear these if present
 		 * before we process a new event.
 		 */
 		(void) bunyan_key_remove(w->w_log, BLOG_KEY_SRC);
@@ -452,22 +426,6 @@ do_user(int events, void *user)
 	}
 }
 
-static void
-worker_pkt_inbound(pkt_t *pkt)
-{
-	switch (IKE_GET_MAJORV(pkt_header(pkt)->version)) {
-	case 1:
-		/* XXX: ikev1_inbound(pkt); */
-		break;
-	case 2:
-		ikev2_inbound(pkt);
-		break;
-	default:
-		/* XXX: log? */
-		pkt_free(pkt);
-	}
-}
-
 boolean_t
 worker_send_cmd(worker_cmd_t cmd, void *arg)
 {
@@ -478,32 +436,20 @@ again:
 	switch (errno) {
 	case EAGAIN:
 		/* This shouldn't happen, but if it does, we can try again */
-		(void) bunyan_warn(log, "port_send() failed with EAGAIN",
-		    BUNYAN_T_STRING, "file", __FILE__,
-		    BUNYAN_T_INT32, "line", __LINE__,
-		    BUNYAN_T_STRING, "func", __func__,
+		STDERR(warn, log, "port_send() failed with EAGAIN",
 		    BUNYAN_T_STRING, "cmd", worker_cmd_str(cmd),
-		    BUNYAN_T_POINTER, "arg", arg,
-		    BUNYAN_T_END);
+		    BUNYAN_T_POINTER, "arg", arg);
 		goto again;
 	case ENOMEM:
-		(void) bunyan_warn(log, "Out of memory trying to send command",
-		    BUNYAN_T_STRING, "file", __FILE__,
-		    BUNYAN_T_INT32, "line", __LINE__,
-		    BUNYAN_T_STRING, "func", __func__,
+		STDERR(warn, log, "Out of memory trying to send command",
 		    BUNYAN_T_STRING, "cmd", worker_cmd_str(cmd),
-		    BUNYAN_T_POINTER, "arg", arg,
-		    BUNYAN_T_END);
+		    BUNYAN_T_POINTER, "arg", arg);
 		break;
 	default:
-		(void) bunyan_fatal(log,
+		STDERR(fatal, log,
 		    "Unexpected error trying to send command",
-		    BUNYAN_T_STRING, "file", __FILE__,
-		    BUNYAN_T_INT32, "line", __LINE__,
-		    BUNYAN_T_STRING, "func", __func__,
 		    BUNYAN_T_STRING, "cmd", worker_cmd_str(cmd),
-		    BUNYAN_T_POINTER, "arg", arg,
-		    BUNYAN_T_END);
+		    BUNYAN_T_POINTER, "arg", arg);
 		abort();
 	}
 

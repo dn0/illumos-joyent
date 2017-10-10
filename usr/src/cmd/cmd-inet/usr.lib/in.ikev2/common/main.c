@@ -407,13 +407,8 @@ signal_init(void)
 	rc = thr_create(NULL, 0, signal_thread, NULL, THR_DETACHED,
 	    &signal_tid);
 	if (rc != 0) {
-		bunyan_fatal(log, "Signal handling thread creation failed",
-		    BUNYAN_T_STRING, "errmsg", strerror(rc),
-		    BUNYAN_T_INT32, "errno", (int32_t)rc,
-		    BUNYAN_T_STRING, "file", __FILE__,
-		    BUNYAN_T_INT32, "line", (int32_t)__LINE__,
-		    BUNYAN_T_STRING, "func", __func__,
-		    BUNYAN_T_END);
+		TSTDERR(rc, fatal, log,
+		    "Signal handling thread creation failed");
 		exit(EXIT_FAILURE);
 	}
 }

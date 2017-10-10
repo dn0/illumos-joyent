@@ -49,6 +49,7 @@
 #include "defs.h"
 #include "ikev2_cookie.h"
 #include "ikev2_pkt.h"
+#include "ikev2_proto.h"
 #include "ikev2_sa.h"
 #include "ilist.h"
 #include "pkcs11.h"
@@ -75,6 +76,7 @@ static uint_t		num_buckets;	/* Use same value for all hashes */
 static uint32_t		remote_noise;	/* random noise for rhash */
 static i2sa_bucket_t	*hash[I2SA_NUM_HASH];
 static umem_cache_t	*i2sa_cache;
+static umem_cache_t	*i2c_cache;
 
 #define	I2SA_KEY_I2SA		"i2sa"
 #define	I2SA_KEY_LADDR		"local_addr"
@@ -341,23 +343,27 @@ static void
 i2sa_p1_expire(void *data)
 {
 	ikev2_sa_t *i2sa = data;
+	int rc;
 
 	(void) bunyan_info(i2sa->i2sa_log, "Larval IKE SA timeout",
 	    BUNYAN_T_END);
 
-	mutex_enter(&i2sa->i2sa_lock);
-	/* Remove periodic id after one shot timer has fired */
-	i2sa->i2sa_p1_timer = 0;
-
-	if (i2sa->i2sa_state == IKEV2_SA_IDLE) {
-		ikev2_sa_condemn(i2sa);
-		/* XXX: Anything else? */
-	} else {
-		i2sa->flags |= I2SA_P1_EXPIRE;
-	}
-	mutex_exit(&i2sa->i2sa_lock);
+	mutex_enter(&i2sa->i2sa_queue_lock);
+	i2sa->i2sa_events |= I2SA_EVT_P1_EXPIRE;
+	ikev2_dispatch(i2sa);
+	mutex_exit(&i2sa->i2sa_queue_lock);
 
 	I2SA_REFRELE(i2sa);
+}
+
+void
+ikev2_sa_p1_expire(ikev2_sa_t *i2sa)
+{
+	VERIFY(MUTEX_HELD(&i2sa->i2sa_lock));
+
+	/* Clear periodic id after one shot timer has fired */
+	i2sa->i2sa_p1_timer = 0;
+	ikev2_sa_condemn(i2sa);
 }
 
 void
@@ -369,14 +375,12 @@ ikev2_sa_flush(void)
 void
 ikev2_sa_condemn(ikev2_sa_t *i2sa)
 {
-	I2SA_REFHOLD(i2sa);
+	VERIFY(MUTEX_HELD(&i2sa->i2sa_lock));
 
+	I2SA_REFHOLD(i2sa);
 	i2sa_unlink(i2sa);
 
-	mutex_enter(&i2sa->i2sa_lock);
-
 	(void) bunyan_info(i2sa->i2sa_log, "Condemning IKE SA", BUNYAN_T_END);
-
 	i2sa->flags |= I2SA_CONDEMNED;
 
 	/*
@@ -420,12 +424,10 @@ ikev2_sa_condemn(ikev2_sa_t *i2sa)
 	i2sa->last_sent = NULL;
 	i2sa->last_recvd = NULL;
 
-	for (size_t i = 0; i < IKEV2_SA_QUEUE_DEPTH; i++) {
+	for (size_t i = 0; i < I2SA_QUEUE_DEPTH; i++) {
 		ikev2_pkt_free(i2sa->i2sa_queue[i]);
 		i2sa->i2sa_queue[i] = NULL;
 	}
-
-	mutex_exit(&i2sa->i2sa_lock);
 
 	I2SA_REFRELE(i2sa);
 	/* XXX: should we do anything else here? */
@@ -472,7 +474,7 @@ ikev2_sa_free(ikev2_sa_t *i2sa)
 	bunyan_fini(i2sa->i2sa_log);
 
 	i2sa_dtor(i2sa, NULL);
-	i2sa_ctor(i2sa, NULL, 0);
+	(void) i2sa_ctor(i2sa, NULL, 0);
 	umem_cache_free(i2sa_cache, i2sa);
 }
 
@@ -483,6 +485,8 @@ ikev2_sa_set_hashsize(uint_t newamt)
 	size_t nold = num_buckets;
 	int i, hashtbl;
 	boolean_t startup = B_FALSE;
+
+	VERIFY(!IS_WORKER);
 
 	for (i = 0; i < I2SA_NUM_HASH; i++)
 		old[i] = hash[i];
@@ -610,6 +614,9 @@ nomem:
 void
 ikev2_sa_set_remote_spi(ikev2_sa_t *i2sa, uint64_t remote_spi)
 {
+	VERIFY(IS_WORKER);
+	VERIFY(MUTEX_HELD(&i2sa->i2sa_lock));
+
 	/* Never a valid SPI value */
 	VERIFY3U(remote_spi, !=, 0);
 
@@ -885,7 +892,11 @@ i2sa_ctor(void *buf, void *dummy, int flags)
 	(void) memset(i2sa, 0, sizeof (*i2sa));
 	i2sa->msgwin = 1;
 
-	mutex_init(&i2sa->i2sa_lock, USYNC_THREAD|LOCK_ERRORCHECK, NULL);
+	VERIFY0(mutex_init(&i2sa->i2sa_lock, USYNC_THREAD|LOCK_ERRORCHECK,
+	    NULL));
+	VERIFY0(mutex_init(&i2sa->i2sa_queue_lock, USYNC_THREAD|LOCK_ERRORCHECK,
+	    NULL));
+
 	list_link_init(&i2sa->i2sa_lspi_node);
 	list_link_init(&i2sa->i2sa_rspi_node);
 
@@ -899,7 +910,32 @@ i2sa_dtor(void *buf, void *dummy)
 
 	ikev2_sa_t *i2sa = (ikev2_sa_t *)buf;
 
-	mutex_destroy(&i2sa->i2sa_lock);
+	VERIFY0(mutex_destroy(&i2sa->i2sa_lock));
+	VERIFY0(mutex_destroy(&i2sa->i2sa_queue_lock));
+	VERIFY(!list_link_active(&i2sa->i2sa_lspi_node));
+	VERIFY(!list_link_active(&i2sa->i2sa_rspi_node));
+}
+
+static int
+i2c_ctor(void *buf, void *dummy, int flags)
+{
+	NOTE(ARGUNUSED(dummy, flags))
+
+	ikev2_child_sa_t *i2c = buf;
+
+	(void) memset(i2c, 0, sizeof (*i2c));
+	list_link_init(&i2c->i2c_node);
+	return (0);
+}
+
+static void
+i2c_dtor(void *buf, void *dummy)
+{
+	NOTE(ARGUNUSED(dummy))
+
+	ikev2_child_sa_t *i2c = buf;
+
+	VERIFY(!list_link_active(&i2c->i2c_node));
 }
 
 static int
@@ -1039,7 +1075,12 @@ ikev2_sa_init(void)
 {
 	if ((i2sa_cache = umem_cache_create("IKEv2 SAs", sizeof (ikev2_sa_t),
 	    0, i2sa_ctor, i2sa_dtor, NULL, NULL, NULL, 0)) == NULL)
-		err(EXIT_FAILURE, "Unable to allocate IKEv2 SA cache");
+		err(EXIT_FAILURE, "Unable to create IKEv2 SA cache");
+
+	if ((i2c_cache = umem_cache_create("IKEv2 Child SAs",
+	    sizeof (ikev2_child_sa_t), 0, i2c_ctor, i2c_dtor, NULL, NULL, NULL,
+	    0)) == NULL)
+		err(EXIT_FAILURE, "Unable to create IKEv2 Child SA cache");
 
 	/* XXX: Change to tunable */
 	ikev2_sa_set_hashsize(ikev2_sa_buckets);
@@ -1049,4 +1090,5 @@ void
 ikev2_sa_fini(void)
 {
 	umem_cache_destroy(i2sa_cache);
+	umem_cache_destroy(i2c_cache);
 }
