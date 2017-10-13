@@ -30,8 +30,9 @@ struct bunyan_logger;
 struct periodic_handle;
 
 typedef enum worker_cmd {
-	WC_NONE,
+	WC_NONE = 0,
 	WC_QUIT,
+	WC_PFKEY,
 	WC_START,
 } worker_cmd_t;
 
@@ -41,6 +42,15 @@ typedef struct worker {
 	struct bunyan_logger	*w_log;
 	CK_SESSION_HANDLE	w_p11;
 	boolean_t		w_quit;
+				/*
+				 * We create a per-worker buffer for inbound
+				 * datagrams so we are always guaranteed we
+				 * can receive the datagram and drain it
+				 * from the kernel's queue and if we're lucky
+				 * be able to log information about it, even
+				 * if we have to discard it due to allocation
+				 * failures.
+				 */
 	uint64_t		w_buf[SADB_8TO64(MAX_PACKET_SIZE)];
 } worker_t;
 

@@ -132,6 +132,12 @@ ikev2_sa_get(uint64_t l_spi, uint64_t r_spi,
 		.ic_raddr = r_addr
 	};
 
+	/*
+	 * XXX: We need to support searching based strictly on local and remote
+	 * addresses without a remote SPI for matching ACQUIRES to existing IKE
+	 * SAs
+	 */
+
 	if (l_spi != 0) {
 		/*
 		 * We assign the local SPIs, so if it is set (!= 0), that
@@ -155,9 +161,9 @@ ikev2_sa_get(uint64_t l_spi, uint64_t r_spi,
 		if (rc == 0)
 			sa = node;
 		/*
- 		 * The list is sorted, so if we reach a node > than what
- 		 * we're looking for, it's not there.
- 		 */
+		 * The list is sorted, so if we reach a node > than what
+		 * we're looking for, it's not there.
+		 */
 		break;
 	}
 
@@ -185,7 +191,9 @@ ikev2_sa_get(uint64_t l_spi, uint64_t r_spi,
  * 	laddr,
  * 	raddr		The local and remote addresses of this SA.
  *
- * On successful create, the larval IKEv2 SA is returned.
+ * On successful create, the refheld larval IKEv2 SA is returned.  In addition,
+ * the IKEv2 SA queue is locked on return.
+ *
  * On failure, NULL is returned.  Caller maintains responsibility for
  * init_pkt in this instance.
  *
@@ -217,7 +225,10 @@ ikev2_sa_alloc(boolean_t initiator,
 		return (NULL);
 
 	/* Keep anyone else out while we initialize */
+	mutex_enter(&i2sa->i2sa_queue_lock);
 	mutex_enter(&i2sa->i2sa_lock);
+
+	i2sa->i2sa_tid = thr_self();
 
 	ASSERT((init_pkt == NULL) ||
 	    (init_pkt->hdr.exch_type == IKEV2_EXCHANGE_IKE_SA_INIT));
@@ -240,9 +251,9 @@ ikev2_sa_alloc(boolean_t initiator,
 		arc4random_buf(&spi, sizeof (spi));
 
 		/*
- 		 * Incredibly unlikely we'll ever randomly generate 0, but
- 		 * if we do, just try again.
- 		 */
+		 * Incredibly unlikely we'll ever randomly generate 0, but
+		 * if we do, just try again.
+		 */
 		if (spi == 0)
 			continue;
 
@@ -310,8 +321,13 @@ ikev2_sa_alloc(boolean_t initiator,
 		    BUNYAN_T_END);
 		goto fail;
 	}
-
+	i2sa->i2sa_tid = 0;
 	mutex_exit(&i2sa->i2sa_lock);
+
+	/*
+	 * Leave i2sa_queue_lock held so caller has exclusive access to SA
+	 * upon return.
+	 */
 
 	(void) bunyan_debug(i2sa->i2sa_log, "New larval IKE SA created",
 	    BUNYAN_T_POINTER, "sa", i2sa,
@@ -320,8 +336,10 @@ ikev2_sa_alloc(boolean_t initiator,
 	return (i2sa);
 
 fail:
-	mutex_exit(&i2sa->i2sa_lock);
 	i2sa_unlink(i2sa);
+	i2sa->i2sa_tid = 0;
+	mutex_exit(&i2sa->i2sa_lock);
+	mutex_exit(&i2sa->i2sa_queue_lock);
 
 	/*
 	 * When refcnt goes from 1->0, i2sa will get freed, so do last one
@@ -357,16 +375,6 @@ i2sa_p1_expire(void *data)
 }
 
 void
-ikev2_sa_p1_expire(ikev2_sa_t *i2sa)
-{
-	VERIFY(MUTEX_HELD(&i2sa->i2sa_lock));
-
-	/* Clear periodic id after one shot timer has fired */
-	i2sa->i2sa_p1_timer = 0;
-	ikev2_sa_condemn(i2sa);
-}
-
-void
 ikev2_sa_flush(void)
 {
 	/* TODO: implement me */
@@ -375,38 +383,50 @@ ikev2_sa_flush(void)
 void
 ikev2_sa_condemn(ikev2_sa_t *i2sa)
 {
-	VERIFY(MUTEX_HELD(&i2sa->i2sa_lock));
+	parsedmsg_t *pmsg = NULL;
 
-	I2SA_REFHOLD(i2sa);
-	i2sa_unlink(i2sa);
+	VERIFY(!MUTEX_HELD(&i2sa->i2sa_queue_lock));
+	VERIFY(MUTEX_HELD(&i2sa->i2sa_lock));
 
 	(void) bunyan_info(i2sa->i2sa_log, "Condemning IKE SA", BUNYAN_T_END);
 	i2sa->flags |= I2SA_CONDEMNED;
 
-	/*
-	 * Unlike the the other timers, which are all currently one shot, this
-	 * one repeats, so if the id is set, it should be there to cancel.
-	 */
-	if (i2sa->last_sent != NULL && i2sa->i2sa_xmit_timer != 0)
-		VERIFY0(periodic_cancel(wk_periodic, i2sa->i2sa_xmit_timer));
+	I2SA_REFHOLD(i2sa);
+	i2sa_unlink(i2sa);
 
-	/*
-	 * However these may have fired in another thread, so if they're gone
-	 * it's ok.
-	 */
-	if (i2sa->i2sa_p1_timer != 0)
-		(void) periodic_cancel(wk_periodic, i2sa->i2sa_p1_timer);
-	if (i2sa->i2sa_softlife_timer != 0)
-		(void) periodic_cancel(wk_periodic, i2sa->i2sa_softlife_timer);
-	if (i2sa->i2sa_hardlife_timer != 0)
+	mutex_exit(&i2sa->i2sa_lock);
+	mutex_enter(&i2sa->i2sa_queue_lock);
+	mutex_enter(&i2sa->i2sa_lock);
+
+	/* If we havent seen these fire yet, cancel them */
+	if (i2sa->i2sa_xmit_timer != 0 &&
+	    !(i2sa->i2sa_events & I2SA_EVT_PKT_XMIT)) {
+		VERIFY0(periodic_cancel(wk_periodic, i2sa->i2sa_xmit_timer));
+	}
+	if (i2sa->i2sa_p1_timer != 0 &&
+	    !(i2sa->i2sa_events & I2SA_EVT_P1_EXPIRE)) {
+		VERIFY0(periodic_cancel(wk_periodic, i2sa->i2sa_p1_timer));
+	}
+	if (i2sa->i2sa_softlife_timer != 0 &&
+	    !(i2sa->i2sa_events & I2SA_EVT_SOFT_EXPIRE)) {
+		VERIFY0(periodic_cancel(wk_periodic,
+		    i2sa->i2sa_softlife_timer));
+	}
+	if (i2sa->i2sa_hardlife_timer != 0 &&
+	    !(i2sa->i2sa_events & I2SA_EVT_HARD_EXPIRE)) {
 		(void) periodic_cancel(wk_periodic, i2sa->i2sa_hardlife_timer);
+	}
+
 	i2sa->i2sa_p1_timer = i2sa->i2sa_softlife_timer =
 	    i2sa->i2sa_xmit_timer = i2sa->i2sa_hardlife_timer = 0;
 
+	/* Drop the queue lock so any pending activity can drain */
+	mutex_exit(&i2sa->i2sa_queue_lock);
+
 	/*
- 	* Since packets keep a reference to the SA they are associated with,
- 	* we must free them here so that their references go away
- 	*/
+	 * Since packets keep a reference to the SA they are associated with,
+	 * we must free them here so that their references go away
+	 */
 	if (i2sa->init_i != i2sa->last_resp_sent &&
 	    i2sa->init_i != i2sa->last_sent)
 		ikev2_pkt_free(i2sa->init_i);
@@ -424,11 +444,50 @@ ikev2_sa_condemn(ikev2_sa_t *i2sa)
 	i2sa->last_sent = NULL;
 	i2sa->last_recvd = NULL;
 
-	for (size_t i = 0; i < I2SA_QUEUE_DEPTH; i++) {
-		ikev2_pkt_free(i2sa->i2sa_queue[i]);
-		i2sa->i2sa_queue[i] = NULL;
+	pmsg = list_head(&i2sa->i2sa_pending);
+	while (pmsg != NULL) {
+		parsedmsg_t *next = list_next(&i2sa->i2sa_pending, pmsg);
+		sadb_msg_t *samsg = pmsg->pmsg_samsg;
+
+		/* Fail/cancel any pending acquires from the kernel */
+		if (samsg->sadb_msg_pid == 0 &&
+		    samsg->sadb_msg_type == SADB_ACQUIRE) {
+			/*
+			 * The kernel currently only cares that errno != 0,
+			 * but this seems like the closest error code to
+			 * what's happening, just to be as informative as
+			 * possible.
+			 */
+			pfkey_send_error(samsg, ECANCELED);
+		}
+
+		list_remove(&i2sa->i2sa_pending, pmsg);
+		parsedmsg_free(pmsg);
+		pmsg = next;
 	}
 
+	/* XXX: remove child SAs */
+
+	mutex_exit(&i2sa->i2sa_lock);
+	mutex_enter(&i2sa->i2sa_queue_lock);
+	mutex_enter(&i2sa->i2sa_lock);
+
+	for (size_t i = 0; i < I2SA_QUEUE_DEPTH; i++) {
+		switch (i2sa->i2sa_queue[i].i2m_type) {
+		case I2SA_MSG_NONE:
+			break;
+		case I2SA_MSG_PKT:
+			ikev2_pkt_free(i2sa->i2sa_queue[i].i2m_data);
+			break;
+		case I2SA_MSG_PFKEY:
+			parsedmsg_free(i2sa->i2sa_queue[i].i2m_data);
+			break;
+		}
+		i2sa->i2sa_queue[i].i2m_type = I2SA_MSG_NONE;
+		i2sa->i2sa_queue[i].i2m_data = NULL;
+	}
+
+	mutex_exit(&i2sa->i2sa_queue_lock);
 	I2SA_REFRELE(i2sa);
 	/* XXX: should we do anything else here? */
 }
@@ -780,7 +839,11 @@ i2sa_verify(ikev2_sa_t *restrict i2sa, uint64_t rem_spi,
 
 	(void) bunyan_trace(i2sa->i2sa_log, "IKEv2 SA found",
 	    BUNYAN_T_STRING, "func", __func__,
+	    BUNYAN_T_POINTER, "i2sa", i2sa,
 	    BUNYAN_T_END);
+
+	VERIFY(!MUTEX_HELD(&i2sa->i2sa_lock));
+	VERIFY(!MUTEX_HELD(&i2sa->i2sa_queue_lock));
 	return (i2sa);
 
 bad_match:
@@ -882,6 +945,36 @@ dec_half_open(void)
 		ikev2_cookie_disable();
 }
 
+/*
+ * Add a message to the queue of the given IKEv2 SA.  Must be called
+ * with sa->i2sa_queue_lock held.  Returns B_TRUE if message was successfully
+ * added to the queue, B_FALSE if the queue was full.  If the given SA is
+ * not already processing messages on another thread, it will also process
+ * anything queued.  Returns with sa->i2sa_queue_lock released.
+ */
+boolean_t
+ikev2_sa_queuemsg(ikev2_sa_t *sa, i2sa_msg_type_t type, void *data)
+{
+	VERIFY(IS_WORKER);
+	VERIFY(MUTEX_HELD(&sa->i2sa_queue_lock));
+
+	if (I2SA_QUEUE_FULL(sa)) {
+		mutex_exit(&sa->i2sa_queue_lock);
+		return (B_FALSE);
+	}
+
+	i2sa_msg_t *msg = &sa->i2sa_queue[sa->i2sa_queue_start];
+
+	msg->i2m_type = type;
+	msg->i2m_data = data;
+	sa->i2sa_queue_start++;
+	sa->i2sa_queue_start %= I2SA_QUEUE_DEPTH;
+	ikev2_dispatch(sa);
+	mutex_exit(&sa->i2sa_queue_lock);
+
+	return (B_TRUE);
+}
+
 static int
 i2sa_ctor(void *buf, void *dummy, int flags)
 {
@@ -899,7 +992,10 @@ i2sa_ctor(void *buf, void *dummy, int flags)
 
 	list_link_init(&i2sa->i2sa_lspi_node);
 	list_link_init(&i2sa->i2sa_rspi_node);
-
+	list_create(&i2sa->i2sa_pending, sizeof (parsedmsg_t),
+	    offsetof(parsedmsg_t, pmsg_node));
+	list_create(&i2sa->i2sa_child_sas, sizeof (ikev2_child_sa_t),
+	    offsetof(ikev2_child_sa_t, i2c_node));
 	return (0);
 }
 
@@ -914,6 +1010,10 @@ i2sa_dtor(void *buf, void *dummy)
 	VERIFY0(mutex_destroy(&i2sa->i2sa_queue_lock));
 	VERIFY(!list_link_active(&i2sa->i2sa_lspi_node));
 	VERIFY(!list_link_active(&i2sa->i2sa_rspi_node));
+	VERIFY(list_is_empty(&i2sa->i2sa_pending));
+	VERIFY(list_is_empty(&i2sa->i2sa_child_sas));
+	list_destroy(&i2sa->i2sa_pending);
+	list_destroy(&i2sa->i2sa_child_sas);
 }
 
 static int
@@ -1068,6 +1168,22 @@ i2sa_key_add_addr(ikev2_sa_t *i2sa, const char *addr_key, const char *port_key,
 	}
 
 	return ((rc == 0) ? B_TRUE : B_FALSE);
+}
+
+const char *
+i2sa_msgtype_str(i2sa_msg_type_t type)
+{
+#define	STR(x)	case x: return (#x);
+	switch (type) {
+	STR(I2SA_MSG_NONE);
+	STR(I2SA_MSG_PKT);
+	STR(I2SA_MSG_PFKEY);
+	}
+#undef STR
+
+	INVALID("type");
+	/*NOTREACHED*/
+	return (NULL);
 }
 
 void

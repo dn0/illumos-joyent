@@ -112,6 +112,7 @@ ikev2_pkt_new_inbound(void *restrict buf, size_t buflen)
 	size_t			*counts = NULL;
 	size_t			i = 0;
 	boolean_t		keep = B_TRUE;
+	char			exch[IKEV2_ENUM_STRLEN];
 
 	VERIFY(IS_WORKER);
 
@@ -138,7 +139,8 @@ ikev2_pkt_new_inbound(void *restrict buf, size_t buflen)
 		(void) bunyan_info(worker->w_log,
 		    "Unknown/unsupported exchange type",
 		    BUNYAN_T_STRING, "exch_type",
-		    ikev2_exch_str(hdr->exch_type), BUNYAN_T_END);
+		    ikev2_exch_str(hdr->exch_type, exch, sizeof (exch)),
+		    BUNYAN_T_END);
 		return (NULL);
 	}
 
@@ -1247,6 +1249,7 @@ static boolean_t
 check_payloads(pkt_t *pkt)
 {
 	size_t paycount[IKEV2_NUM_PAYLOADS] = { 0 };
+	char logbuf[64];
 
 #define	PAYCOUNT(type)	paycount[(type) - IKEV2_PAYLOAD_MIN]
 
@@ -1258,8 +1261,9 @@ check_payloads(pkt_t *pkt)
 		if (pay->pay_reserved & IKEV2_CRITICAL_PAYLOAD) {
 			(void) bunyan_info(log,
 			    "Packet payload has critical bit set",
-			    BUNYAN_T_UINT32, "payload", (uint32_t)idx->pp_type,
-			    BUNYAN_T_END);
+			    BUNYAN_T_STRING, "payload",
+			    ikev2_pay_str(idx->pp_type, logbuf,
+			    sizeof (logbuf)), BUNYAN_T_END);
 			return (B_FALSE);
 		}
 
@@ -1319,17 +1323,21 @@ ikev2_pkt_desc(pkt_t *pkt)
 	size_t len = 0;
 	uint16_t i;
 	uint16_t j;
+	char buf[IKEV2_ENUM_STRLEN];
+	char nbuf[IKEV2_ENUM_STRLEN];
 
 	for (i = j = 0; i < pkt->pkt_payload_count; i++) {
 		pkt_payload_t *pay = pkt_payload(pkt, i);
 		const char *paystr =
-		    ikev2_pay_short_str((ikev2_pay_type_t)pay->pp_type);
+		    ikev2_pay_short_str((ikev2_pay_type_t)pay->pp_type, buf,
+		    sizeof (buf));
 
 		len += strlen(paystr) + 2;
 		if (pay->pp_type == IKEV2_PAYLOAD_NOTIFY) {
 			pkt_notify_t *n = pkt_notify(pkt, j++);
 			const char *nstr =
-			    ikev2_notify_str((ikev2_notify_type_t)n->pn_type);
+			    ikev2_notify_str((ikev2_notify_type_t)n->pn_type,
+			    nbuf, sizeof (nbuf));
 
 			len += strlen(nstr) + 2;
 		}
@@ -1341,7 +1349,8 @@ ikev2_pkt_desc(pkt_t *pkt)
 	for (i = j = 0; i < pkt->pkt_payload_count; i++) {
 		pkt_payload_t *pay = pkt_payload(pkt, i);
 		const char *paystr =
-		    ikev2_pay_short_str((ikev2_pay_type_t)pay->pp_type);
+		    ikev2_pay_short_str((ikev2_pay_type_t)pay->pp_type, buf,
+		    sizeof (buf));
 
 		if (i > 0)
 			(void) strlcat(s, ", ", len);
@@ -1350,7 +1359,8 @@ ikev2_pkt_desc(pkt_t *pkt)
 		if (pay->pp_type == IKEV2_PAYLOAD_NOTIFY) {
 			pkt_notify_t *n = pkt_notify(pkt, j++);
 			const char *nstr =
-			    ikev2_notify_str((ikev2_notify_type_t)n->pn_type);
+			    ikev2_notify_str((ikev2_notify_type_t)n->pn_type,
+			    nbuf, sizeof (nbuf));
 
 			/*
 			 * Notify type is 16-bits, so (XXXXX) (7 chars) is
@@ -1391,6 +1401,7 @@ ikev2_pkt_log(pkt_t *restrict pkt, bunyan_logger_t *restrict log,
 	char ispi[19];
 	char rspi[19];
 	char flag[30];
+	char exch[IKEV2_ENUM_STRLEN];
 
 	VERIFY3P(descstr, !=, NULL);
 
@@ -1399,6 +1410,7 @@ ikev2_pkt_log(pkt_t *restrict pkt, bunyan_logger_t *restrict log,
 	(void) snprintf(rspi, sizeof (rspi), "0x%" PRIX64,
 	    ntohll(hdr->responder_spi));
 	(void) snprintf(flag, sizeof (flag), "0x%" PRIx8, hdr->flags);
+
 	if (hdr->flags != 0) {
 		size_t count = 0;
 
@@ -1420,9 +1432,9 @@ ikev2_pkt_log(pkt_t *restrict pkt, bunyan_logger_t *restrict log,
 	getlog(level)(log, msg,
 	    BUNYAN_T_POINTER, "pkt", pkt,
 	    BUNYAN_T_STRING, "initiator_spi", ispi,
-	    BUNYAN_T_UINT64, "responder_spi", rspi,
+	    BUNYAN_T_STRING, "responder_spi", rspi,
 	    BUNYAN_T_STRING, "exch_type",
-	    ikev2_exch_str(hdr->exch_type),
+	    ikev2_exch_str(hdr->exch_type, exch, sizeof (exch)),
 	    BUNYAN_T_UINT32, "msgid", ntohl(pkt_header(pkt)->msgid),
 	    BUNYAN_T_UINT32, "msglen", ntohl(pkt_header(pkt)->length),
 	    BUNYAN_T_STRING, "flags", flag,

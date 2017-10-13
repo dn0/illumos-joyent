@@ -10,7 +10,7 @@
  */
 
 /*
- * Copyright 2017 Joyent, Inc.
+ * Copyright (c) 2017 Joyent, Inc.
  */
 
 #include <bunyan.h>
@@ -33,9 +33,19 @@
 #include "worker.h"
 
 /*
- * Workers handle the bulk of the IKE processing.
+ * Virtually all work in in.ikev2d is done via a pool of worker threads.
+ * Each worker in the worker pool has an event loop that broadly waits for
+ * an event to arrive on the event port, gets it, and processes the event.
+ * Events can be things like inbound IKE/ISAKMP datagrams, SADB messages
+ * from our pfkey socket, timer events, or administrative requests.
+ *
+ * Each worker thread has a number of items allocated for it during thread
+ * creation (the members of worker_t).  These items are things that for
+ * debugging purposes, or things where we don't want to worry about allocation
+ * failures during processing (such as a PKCS#11 session handle).
  */
 
+/* The state of the worker pool */
 typedef enum worker_state {
 	WS_NORMAL = 0,
 	WS_SUSPENDING,
@@ -49,6 +59,7 @@ typedef enum worker_alert {
 	WA_SUSPEND,
 } worker_alert_t;
 
+/* Our per-worker thread items */
 __thread worker_t *worker = NULL;
 
 int wk_evport = -1;
@@ -74,15 +85,12 @@ static worker_t *worker_new(void);
 static void worker_free(worker_t *);
 static void *worker_main(void *);
 static const char *worker_cmd_str(worker_cmd_t);
-static void worker_pkt_inbound(pkt_t *);
 
 static void do_alert(int, void *);
 static void do_user(int, void *);
 
 /*
- * Create a pool of worker threads with the given queue depth.
- * Workers are left suspended under the assumption they will be
- * resumed once main_loop() starts.
+ * Create a pool of worker threads with the given number of threads.
  */
 void
 worker_init(size_t n)
@@ -90,9 +98,8 @@ worker_init(size_t n)
 	if ((wk_evport = port_create()) == -1)
 		err(EXIT_FAILURE, "port_create() failed");
 
-	/* CLOCK_READTIME should be good enough for our purposes */
-	if ((wk_periodic = periodic_init(wk_evport, NULL, CLOCK_REALTIME))
-	    == NULL)
+	wk_periodic = periodic_init(wk_evport, NULL, CLOCK_MONOTONIC);
+	if (wk_periodic == NULL)
 		err(EXIT_FAILURE, "could not create periodic");
 
 	mutex_enter(&worker_lock);
@@ -125,6 +132,7 @@ worker_add(void)
 	while (worker_state != WS_NORMAL && worker_state != WS_QUITTING)
 		VERIFY0(cond_wait(&worker_cv, &worker_lock));
 
+	/* If we're shutting down, don't bother creating the worker */
 	if (worker_state == WS_QUITTING)
 		goto fail;
 
@@ -155,6 +163,7 @@ again:
 
 	list_insert_tail(&workers, w);
 	VERIFY0(cond_broadcast(&worker_cv));
+	wk_nworkers++;
 	mutex_exit(&worker_lock);
 
 	return (B_TRUE);
@@ -190,7 +199,7 @@ worker_suspend(void)
 {
 	/*
 	 * We currently do not support workers suspending all the workers.
-	 * This must be called from a non-worker thread.
+	 * This must be called from a non-worker thread such as the main thread.
 	 */
 	VERIFY(!IS_WORKER);
 
@@ -200,15 +209,23 @@ again:
 	switch (worker_state) {
 	case WS_NORMAL:
 		break;
+	/* No point in suspending if we are quitting */
 	case WS_QUITTING:
+	/*
+	 * Ignore additional attempts to suspend if already in progress or
+	 * already suspended.
+	 */
 	case WS_SUSPENDING:
 	case WS_SUSPENDED:
 		mutex_exit(&worker_lock);
 		return;
+	/* If we're resuming, wait until it's finished and retry */
 	case WS_RESUMING:
 		cond_wait(&worker_cv, &worker_lock);
 		goto again;
 	}
+
+	VERIFY(MUTEX_HELD(&worker_lock));
 
 	worker_state = WS_SUSPENDING;
 	(void) bunyan_debug(log, "Suspending workers", BUNYAN_T_END);
@@ -358,8 +375,17 @@ worker_main(void *arg)
 			periodic_fire(wk_periodic);
 			continue;
 		case PORT_SOURCE_FD: {
+			char buf[20] = { 0 };
+
 			void (*fn)(int) = (void (*)(int))pe.portev_user;
 			int fd = (int)pe.portev_object;
+
+			(void) bunyan_trace(w->w_log,
+			    "Dispatching fd event to handler",
+			    BUNYAN_T_INT32, "fd", (int32_t)fd,
+			    BUNYAN_T_STRING, "handler",
+			    symstr(fn, buf, sizeof (buf)),
+			    BUNYAN_T_END);
 
 			fn(fd);
 			continue;
@@ -407,6 +433,11 @@ do_user(int events, void *user)
 
 	ikev2_sa_t *sa = user;
 
+	(void) bunyan_trace(worker->w_log, "Received user event",
+	    BUNYAN_T_STRING, "event", worker_cmd_str(events),
+	    BUNYAN_T_POINTER, "arg", user,
+	    BUNYAN_T_END);
+
 	switch((worker_cmd_t)events) {
 	case WC_NONE:
 		return;
@@ -420,8 +451,11 @@ do_user(int events, void *user)
 			worker->w_quit = B_TRUE;
 		mutex_exit(&worker_lock);
 		return;
+	case WC_PFKEY:
+		ikev2_pfkey(user);
+		return;
 	case WC_START:
-		ikev2_sa_init_outbound(sa, NULL, 0, IKEV2_DH_NONE, NULL, 0);
+		ikev2_sa_init_cfg(user);
 		return;
 	}
 }
@@ -470,6 +504,7 @@ worker_cmd_str(worker_cmd_t wc)
 	STR(WC_NONE);
 	STR(WC_QUIT);
 	STR(WC_START);
+	STR(WC_PFKEY);
 	}
 
 	INVALID(wc);

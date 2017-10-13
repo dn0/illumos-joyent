@@ -79,23 +79,15 @@ getbuf(void)
 }
 
 const char *
-symstr(void *addr)
+symstr(void *addr, char *buf, size_t buflen)
 {
-	struct strbuf_s *buf = getbuf();
 	Dl_info_t dlinfo = { 0 };
 
-	if (buf == NULL)
-		return ("");
+	if (dladdr(addr, &dlinfo) != 0)
+		return (dlinfo.dli_sname);
 
-	if (dladdr(addr, &dlinfo) == 0) {
-		(void) snprintf(buf->symstr, sizeof (buf->symstr), "0x%p",
-		    addr);
-	} else {
-		(void) strlcpy(buf->symstr, dlinfo.dli_sname,
-		    sizeof (buf->symstr));
-	}
-
-	return (buf->symstr);
+	(void) snprintf(buf, buflen, "0x%p", addr);
+	return (buf);
 }
 
 const char *

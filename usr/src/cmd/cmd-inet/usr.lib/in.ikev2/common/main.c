@@ -37,6 +37,11 @@
 #include "pkcs11.h"
 #include "worker.h"
 
+typedef struct lockingfd {
+	mutex_t lf_lock;
+	int	lf_fd;
+} lockingfd_t;
+
 extern void pkt_init(void);
 extern void pkt_fini(void);
 extern void ikev2_sa_init(void);
@@ -95,11 +100,28 @@ nofail_cb(void)
 	return (UMEM_CALLBACK_EXIT(EXIT_FAILURE));
 }
 
+/*
+ * For now at least, a workaround so that multiple bunyan children don't
+ * step on each other during output be serializing writes to the same fd.
+ */
+static int
+lockingfd_log(nvlist_t *nvl, const char *js, void *arg)
+{
+	lockingfd_t *lf = arg;
+	int ret;
+
+	mutex_enter(&lf->lf_lock);
+	ret = bunyan_stream_fd(nvl, js, (void *)(uintptr_t)lf->lf_fd);
+	mutex_exit(&lf->lf_lock);
+	return (ret);
+}
+
 int
 main(int argc, char **argv)
 {
 	FILE *f = NULL;
 	char *cfgfile = "/etc/inet/ike/config";
+	lockingfd_t logfd = { ERRORCHECKMUTEX, STDOUT_FILENO };
 	int c, rc;
 	boolean_t debug_mode = B_FALSE;
 	boolean_t check_cfg = B_FALSE;
@@ -141,11 +163,12 @@ main(int argc, char **argv)
 	if ((rc = bunyan_init(basename(argv[0]), &log)) < 0)
 		errx(EXIT_FAILURE, "bunyan_init() failed: %s", strerror(rc));
 
-	/* hard coded just during development */
+	/* hard coded to TRACE just during development */
 	if ((rc = bunyan_stream_add(log, "stdout", BUNYAN_L_TRACE,
-	    bunyan_stream_fd, (void *)STDOUT_FILENO)) < 0)
+	    lockingfd_log, &logfd)) < 0) {
 		errx(EXIT_FAILURE, "bunyan_stream_add() failed: %s",
 		    strerror(rc));
+	}
 
 	if ((f = fopen(cfgfile, "rF")) == NULL) {
 		STDERR(fatal, log, "cannot open config file",
@@ -224,39 +247,13 @@ do_immediate(void)
 	config_t *cfg = config_get();
 
 	for (size_t i = 0; cfg->cfg_rules[i] != NULL; i++) {
-		if (!cfg->cfg_rules[i]->rule_immediate)
+		config_rule_t *rule = cfg->cfg_rules[i];
+
+		if (!rule->rule_immediate)
 			continue;
 
-		config_rule_t *rule = cfg->cfg_rules[i];
-		ikev2_sa_t *sa = NULL;
-		struct sockaddr_storage laddr = { 0 };
-		struct sockaddr_storage raddr = { 0 };
-		sockaddr_u_t sl = { .sau_ss = &laddr };
-		sockaddr_u_t sr = { .sau_ss = &raddr };
-
-		VERIFY3S(rule->rule_local_addr[0].cfa_type, ==, CFG_ADDR_IPV4);
-		VERIFY3S(rule->rule_remote_addr[0].cfa_type, ==, CFG_ADDR_IPV4);
-
-		sl.sau_sin->sin_family = AF_INET;
-		sl.sau_sin->sin_port = htons(IPPORT_IKE);
-		(void) memcpy(&sl.sau_sin->sin_addr,
-		    &rule->rule_local_addr[0].cfa_startu.cfa_ip4,
-		    sizeof (in_addr_t));
-
-		sr.sau_sin->sin_family = AF_INET;
-		sr.sau_sin->sin_port = htons(IPPORT_IKE);
-		(void) memcpy(&sr.sau_sin->sin_addr,
-		    &rule->rule_remote_addr[0].cfa_startu.cfa_ip4,
-		    sizeof (in_addr_t));
-
-		sa = ikev2_sa_alloc(B_TRUE, NULL, &laddr, &raddr);
-		VERIFY3P(sa, !=, NULL);
-
-		bunyan_trace(sa->i2sa_log, "Dispatching larval SA to worker",
-		    BUNYAN_T_STRING, "rule", rule->rule_label,
-		    BUNYAN_T_END);
-
-		VERIFY(worker_send_cmd(WC_START, sa));
+		CONFIG_REFHOLD(cfg);	/* for worker */
+		VERIFY(worker_send_cmd(WC_START, rule));
 	}
 
 	CONFIG_REFRELE(cfg);

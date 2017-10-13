@@ -27,9 +27,12 @@
  * Copyright (c) 2017, Joyent, Inc
  */
 
-#include <note.h>
+#include <errno.h>
+#include <ipsec_util.h>
 #include <libperiodic.h>
+#include <note.h>
 #include <string.h>
+#include <sys/debug.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include "config.h"
@@ -51,6 +54,9 @@
 	## __VA_ARGS__)
 
 static void ikev2_retransmit_cb(void *);
+static void ikev2_dispatch_pkt(pkt_t *);
+static void ikev2_dispatch_pfkey(ikev2_sa_t *restrict, parsedmsg_t *restrict);
+
 static int select_socket(const ikev2_sa_t *);
 
 static ikev2_sa_t *ikev2_try_new_sa(pkt_t *restrict,
@@ -106,36 +112,29 @@ ikev2_inbound(pkt_t *pkt, const struct sockaddr_storage *restrict src_addr,
 			return;
 		}
 
+		/* On success, returns with i2sa_queue_lock held */
 		i2sa = ikev2_try_new_sa(pkt, dest_addr, src_addr);
 		if (i2sa == NULL) {
 			ikev2_pkt_free(pkt);
 			return;
 		}
+	} else {
+		mutex_enter(&i2sa->i2sa_queue_lock);
 	}
 
-	local_spi = I2SA_LOCAL_SPI(i2sa);
-
+	VERIFY(MUTEX_HELD(&i2sa->i2sa_queue_lock));
 	/*
 	 * ikev2_sa_get and ikev2_try_new_sa both return refheld ikev2_sa_t's
 	 * that we then give to the inbound packet.
 	 */
 	pkt->pkt_sa = i2sa;
 
-	/* Enqueue packet and attempt to dispatch */
-	mutex_enter(&i2sa->i2sa_queue_lock);
-	if (I2SA_QUEUE_FULL(i2sa)) {
+	if (!ikev2_sa_queuemsg(i2sa, I2SA_MSG_PKT, pkt)) {
 		(void) bunyan_info(i2sa->i2sa_log,
 		    "queue full; discarding packet",
 		    BUNYAN_T_POINTER, "pkt", pkt, BUNYAN_T_END);
-		mutex_exit(&i2sa->i2sa_queue_lock);
-		ikev2_pkt_free(pkt);
-		return;
+		ikev2_pkt_free(pkt);	/* Also refrele's pkt->pkt_sa */
 	}
-
-	i2sa->i2sa_queue[i2sa->i2sa_queue_start++] = pkt;
-	i2sa->i2sa_queue_start %= I2SA_QUEUE_DEPTH;
-	ikev2_dispatch(i2sa);
-	mutex_exit(&i2sa->i2sa_queue_lock);
 }
 
 /*
@@ -209,6 +208,193 @@ fail:
 }
 
 /*
+ * Take a parsed pfkey message, and either locate an existing IKE SA and
+ * add to it's queue, or create a larval IKE SA and kickoff the
+ * IKE_SA_INIT exchange.
+ */
+void
+ikev2_pfkey(parsedmsg_t *pmsg)
+{
+	ikev2_sa_t *sa = NULL;
+	sadb_x_kmc_t *kmc = NULL;
+	uint64_t local_spi = 0;
+	sockaddr_u_t laddr;
+	sockaddr_u_t raddr;
+
+	/*
+	 * XXX: Once OPS/OPD extensions are there, this probably needs
+	 * to be changed.
+	 */
+	laddr = pmsg->pmsg_sau;
+	raddr = pmsg->pmsg_dau;
+
+	kmc = (sadb_x_kmc_t *)pmsg->pmsg_exts[SADB_X_EXT_KM_COOKIE];
+	if (kmc != NULL) {
+		VERIFY3U(kmc->sadb_x_kmc_exttype, ==, SADB_X_EXT_KM_COOKIE);
+		local_spi = kmc->sadb_x_kmc_cookie64;
+	}
+
+	sa = ikev2_sa_get(local_spi, 0, laddr.sau_ss, raddr.sau_ss, NULL);
+	if (sa == NULL) {
+		config_rule_t *rule = NULL;
+
+		/*
+		 * The KM cookie (kmc) is what links an IPsec SA to an IKE
+		 * SA.  If we receive a message with a kmc, we should have
+		 * a corresponding IKE SA.  If we receive a message without
+		 * a kmc, the only message that makes any sense is an
+		 * ACQUIRE (kernel requesting keys for an IPsec SA).  Any
+		 * others we drop and log (since it shouldn't happen).
+		 */
+		if (kmc != NULL ||
+		    pmsg->pmsg_samsg->sadb_msg_type != SADB_ACQUIRE) {
+			sadb_log(log, BUNYAN_L_ERROR, "Received a pfkey "
+			    "message for a non-existant IKE SA",
+			    pmsg->pmsg_samsg);
+
+			/*
+			 * XXX: Should we try to send an error reply back
+			 * to the kernel?  My guess is no, but need to confirm.
+			 */
+			parsedmsg_free(pmsg);
+			return;
+		}
+
+		rule = config_get_rule(laddr, raddr);
+		if (rule == NULL) {
+			/*
+			 * The kernel currently only cares that sadb_msg_errno
+			 * (set by the 2nd parameter to pfkey_send_error()) is
+			 * != 0.  However we still pick an error code that is
+			 * hopefully somewhat accurate to the reason for the
+			 * failure.
+			 */
+			pfkey_send_error(pmsg->pmsg_samsg, ENOENT);
+			sadb_log(log, BUNYAN_L_ERROR,
+			    "Could not find a matching IKE rule for the "
+			    "SADB ACQUIRE request", pmsg->pmsg_samsg);
+			parsedmsg_free(pmsg);
+			return;
+		}
+
+		/* On success, returns sa with i2sa_queue_lock held */
+		sa = ikev2_sa_alloc(B_TRUE, NULL, laddr.sau_ss, raddr.sau_ss);
+		if (sa == NULL) {
+			/*
+			 * The kernel currently only cares that sadb_msg_errno
+			 * (set by the 2nd parameter to pfkey_send_error()) is
+			 * != 0.  To try to be at least somewhat accurate in
+			 * the reason for the failure, we use whatever error
+			 * was returned by ikev2_sa_alloc().
+			 */
+			VERIFY3S(errno, !=, 0);
+			pfkey_send_error(pmsg->pmsg_samsg, errno);
+			sadb_log(log, BUNYAN_L_ERROR,
+			    "Failed to create larval IKE SA: out of memory",
+			    pmsg->pmsg_samsg);
+			parsedmsg_free(pmsg);
+			return;
+		}
+
+		mutex_enter(&sa->i2sa_lock);
+		sa->i2sa_rule = rule;
+		mutex_exit(&sa->i2sa_lock);
+	} else {
+		mutex_enter(&sa->i2sa_queue_lock);
+	}
+
+	if (!ikev2_sa_queuemsg(sa, I2SA_MSG_PFKEY, pmsg)) {
+		sadb_log(sa->i2sa_log, BUNYAN_L_WARN,
+		    "Could not queue SADB message; discarding",
+		    pmsg->pmsg_samsg);
+		parsedmsg_free(pmsg);
+		I2SA_REFRELE(sa);
+	}
+}
+
+/*
+ * Attempt to create an IKEv2 SA  and start an IKE_SA_INIT exchange
+ * from the given rule.
+ */
+void
+ikev2_sa_init_cfg(config_rule_t *rule)
+{
+	ikev2_sa_t *sa = NULL;
+	parsedmsg_t *pmsg = NULL;
+	struct sockaddr_storage src = { 0 };
+	struct sockaddr_storage dst = { 0 };
+	sockaddr_u_t susrc = { .sau_ss = &src };
+	sockaddr_u_t sudst = { .sau_ss = &dst };
+	sockaddr_u_t isrc = { .sau_ss = NULL };
+	sockaddr_u_t idst = { .sau_ss = NULL };
+	size_t len = 0;
+
+	if (!config_addr_to_ss(&rule->rule_local_addr[0], susrc))
+		goto fail;
+	if (!config_addr_to_ss(&rule->rule_remote_addr[0], sudst))
+		goto fail;
+
+	if (!pfkey_inverse_acquire(susrc, sudst, isrc, idst, &pmsg)) {
+		if (pmsg == NULL) {
+			STDERR(error, worker->w_log, "Inverse acquire failed");
+			goto fail;
+		}
+
+		int errval = pmsg->pmsg_samsg->sadb_msg_errno;
+		uint32_t diag = pmsg->pmsg_samsg->sadb_x_msg_diagnostic;
+
+		if (errval == ENOENT) {
+			char *label = rule->rule_label;
+
+			if (RULE_IS_DEFAULT(rule))
+				label = "<default rule>";
+
+			/* XXX: Add addresses to message? */
+			(void) bunyan_error(worker->w_log,
+			    "Cannot create IKEV2 SA for host: No IPsec "
+			    "configuration found",
+			    BUNYAN_T_STRING, "ike_rule", label,
+			    BUNYAN_T_END);
+			goto fail;
+		}
+
+		TSTDERR(errval, error, log,
+		    "Inverse acquire failed",
+		    (diag > 0) ? BUNYAN_T_UINT32 : BUNYAN_T_END,
+		    "code", diag,
+		    BUNYAN_T_STRING, "diagmsg", keysock_diag(diag),
+		    BUNYAN_T_END);
+		goto fail;
+	}
+
+	sa = ikev2_sa_alloc(B_TRUE, NULL, &src, &dst);
+	if (sa == NULL) {
+		STDERR(error, worker->w_log,
+		    "Failed to allocate larval IKE SA");
+		goto fail;
+	}
+
+	mutex_enter(&sa->i2sa_lock);
+	sa->i2sa_rule = rule;
+	mutex_exit(&sa->i2sa_lock);
+
+	VERIFY(ikev2_sa_queuemsg(sa, I2SA_MSG_PFKEY, pmsg));
+	return;
+
+fail:
+	if (sa != NULL) {
+		VERIFY(MUTEX_HELD(&sa->i2sa_queue_lock));
+		mutex_enter(&sa->i2sa_lock);
+		ikev2_sa_condemn(sa);
+		mutex_exit(&sa->i2sa_lock);
+		mutex_exit(&sa->i2sa_queue_lock);
+		I2SA_REFRELE(sa);
+	}
+	parsedmsg_free(pmsg);
+	CONFIG_REFRELE(rule->rule_config);
+}
+
+/*
  * Sends a packet out.  If pkt is an error reply, is_error should be
  * set so that it is not saved for possible retransmission.
  */
@@ -278,7 +464,7 @@ ikev2_send(pkt_t *pkt, boolean_t is_error)
 		CONFIG_REFRELE(cfg);
 
 		i2sa->last_sent = pkt;
-		if (periodic_schedule(wk_periodic, retry, 0,
+		if (periodic_schedule(wk_periodic, retry, PERIODIC_ONESHOT,
 		    ikev2_retransmit_cb, i2sa, &i2sa->i2sa_xmit_timer) != 0) {
 			/* XXX: msg */
 			return (B_FALSE);
@@ -355,7 +541,7 @@ ikev2_retransmit(ikev2_sa_t *sa)
 	if (retry > retry_max)
 		retry = retry_max;
 	if (pkt->pkt_xmit > limit) {
-		bunyan_info(sa->i2sa_log,
+		(void) bunyan_info(sa->i2sa_log,
 		    "Transmit timeout on packet; deleting IKE SA",
 		    BUNYAN_T_END);
 		ikev2_sa_condemn(sa);
@@ -371,6 +557,21 @@ ikev2_retransmit(ikev2_sa_t *sa)
 	 */
 	(void) sendfromto(select_socket(sa), pkt_start(pkt), pkt_len(pkt),
 	    &sa->laddr, &sa->raddr);
+
+	if (periodic_schedule(wk_periodic, retry, PERIODIC_ONESHOT,
+	    ikev2_retransmit_cb, sa, &sa->i2sa_xmit_timer) != 0) {
+		if (errno == ENOMEM) {
+			(void) bunyan_error(sa->i2sa_log,
+			    "No memory to reschedule packet retransmit; "
+			    "deleting IKE SA", BUNYAN_T_END);
+			ikev2_sa_condemn(sa);
+			return;
+		}
+
+		STDERR(fatal, sa->i2sa_log,
+		    "Unexpected error scheduling packet retransmit");
+		abort();
+	}
 }
 
 /*
@@ -408,6 +609,7 @@ ikev2_retransmit_check(pkt_t *pkt)
 
 		/* A response to our last message */
 		VERIFY0(periodic_cancel(wk_periodic, sa->i2sa_xmit_timer));
+		sa->i2sa_xmit_timer = 0;
 
 		/*
 		 * Corner case: this isn't the actual response in the
@@ -470,11 +672,11 @@ done:
 }
 
 /*
- * Dispatches any queued events and packets.  Must be called with
- * sa->i2sa_queue_lock held.  This is structured so that the first thread
- * that successfully acquires an IKEv2 that isn't currently in use on other
- * workers will pin it (by setting i2sa->i2sa_tid) to that worker until
- * all the pending events and packets have been processed.
+ * Dispatches any queued messages and services any events that have fired. 
+ * Function must be called with sa->i2sa_queue_lock held.  If another thread
+ * is already processing the queue for this IKE SA, the function will return
+ * without doing any processing.  In all instances, the function returns with
+ * sa->i2sa_queue_lock held.
  */
 void
 ikev2_dispatch(ikev2_sa_t *sa)
@@ -485,22 +687,37 @@ ikev2_dispatch(ikev2_sa_t *sa)
 	VERIFY(MUTEX_HELD(&sa->i2sa_queue_lock));
 
 	/*
-	 * Since the first thread that acquires i2sa_lock for this SA will
-	 * pin it (by setting i2sa_tid to it's tid while holding i2sa_lock),
-	 * if we cannot acquire the lock immedately, we know another thread
-	 * has already pinned this IKEv2 SA for the moment and don't need
-	 * to wait.
+	 * The first thread that acquires i2sa_lock for this SA will pin
+	 * the SA to itself by setting i2sa_tid to it's tid (whole holding
+	 * i2sa_lock).  Outside of IKE SA creation and destruction, this
+	 * should be the only other path to acquiring i2sa_lock for this SA.
+	 * If we cannot immediately acquire i2sa_lock, it's either being
+	 * condemned (in which case we don't care about dispatching any
+	 * pending items), or another thread has already started processing
+	 * (in which case we let it do the processing).  In either instance,
+	 * we can just exit.
 	 */
 	switch ((rc = mutex_trylock(&sa->i2sa_lock))) {
 	case 0:
 		if (sa->i2sa_tid != 0 && sa->i2sa_tid != thr_self()) {
 			/*
-			 * Snuck in between runs of this loop on another
-			 * thread.  Let the other thread process everything.
+			 * It is possible we've acquired i2sa_lock between
+			 * iterations of the queue processing loop below
+			 * that is running on another thread.  If that happens,
+			 * just release the lock to allow the other thread to
+			 * proceed, and we return.
 			 */
 			mutex_exit(&sa->i2sa_lock);
 			return;
 		}
+
+		/*
+		 * However, if we have acquired the lock, and i2sa_tid has
+		 * already been set to us, we somehow failed to unpin this SA
+		 * in a previous call to ikev2_dispatch(), and indicates a
+		 * code error somewhere.
+		 */
+		VERIFY3U(sa->i2sa_tid, ==, 0);
 		break;
 	case EBUSY:
 		return;
@@ -509,68 +726,99 @@ ikev2_dispatch(ikev2_sa_t *sa)
 		    "Unexpected mutex_tryenter() failure");
 		abort();
 	}
+
+	/* Pin the IKE SA to us */
 	sa->i2sa_tid = thr_self();
 
 	while (sa->i2sa_events != 0 || !I2SA_QUEUE_EMPTY(sa)) {
-		pkt_t *pkt = NULL;
+		i2sa_msg_type_t type = I2SA_MSG_NONE;
+		void *data = NULL;
+
+		/* Grab any pending events and a queue item if available */
+
+		i2sa_evt_t events = sa->i2sa_events;
+		sa->i2sa_events = I2SA_EVT_NONE;
 
 		/*
-		 * Check if any events have fired.  We start with the things
-		 * that would lead to the destruction of the IKEV2 SA --
-		 * that we we don't (for example) try to retransmit from
-		 * a condemned IKEv2 SA.
+		 * All of these are oneshot periodics.  If they've fired,
+		 * clear the id while we hold both the queue lock and
+		 * the SA lock to indicate they're not armed while no other
+		 * thread can rearm them (since we hold i2sa_lock).
 		 */
-		if (sa->i2sa_events & I2SA_EVT_P1_EXPIRE) {
-			sa->i2sa_events &= ~(I2SA_EVT_P1_EXPIRE);
-			ikev2_sa_p1_expire(sa);
+		if (events & I2SA_EVT_P1_EXPIRE)
+			sa->i2sa_p1_timer = 0;
+		if (events & I2SA_EVT_HARD_EXPIRE)
+			sa->i2sa_hardlife_timer = 0;
+		if (events & I2SA_EVT_SOFT_EXPIRE)
+			sa->i2sa_softlife_timer = 0;
+		if (events & I2SA_EVT_PKT_XMIT)
+			sa->i2sa_xmit_timer = 0;
+
+		if (!I2SA_QUEUE_EMPTY(sa)) {
+
+			/* Pick off a message and release the queue for now */
+			type = sa->i2sa_queue[sa->i2sa_queue_end].i2m_type;
+			data = sa->i2sa_queue[sa->i2sa_queue_end].i2m_data;
+
+			/*
+			 * If we see an empty message, the queue is corrupt.
+			 * Abort to get a snapshot of the process.
+			 */
+			VERIFY3S(type, !=, I2SA_MSG_NONE);
+
+			sa->i2sa_queue[sa->i2sa_queue_end].i2m_type =
+			    I2SA_MSG_NONE;
+			sa->i2sa_queue[sa->i2sa_queue_end].i2m_data = NULL;
+			sa->i2sa_queue_end++;
+			sa->i2sa_queue_end %= I2SA_QUEUE_DEPTH;
 		}
-		if (sa->i2sa_events & I2SA_EVT_HARD_EXPIRE) {
-			sa->i2sa_events &= ~(I2SA_EVT_HARD_EXPIRE);
+
+		/*
+		 * Release the queue so other threads can queue messages for
+		 * this IKE SA.  Since we retain i2sa_lock while processing
+		 * the messages, we release i2sa_lock and reacquire the
+		 * queue lock and then i2sa_lock before starting another
+		 * iteration.  The i2sa_tid check prevents another thread
+		 * from doing anything beyond adding messages to the queue
+		 * while we're still running.
+		 */
+		mutex_exit(&sa->i2sa_queue_lock);
+
+		if (events & I2SA_EVT_P1_EXPIRE) {
+			events &= ~(I2SA_EVT_P1_EXPIRE);
+			ikev2_sa_condemn(sa);
+		}
+		if (events & I2SA_EVT_HARD_EXPIRE) {
+			events &= ~(I2SA_EVT_HARD_EXPIRE);
 			/* TODO: ikev2_sa_hard_expire(sa); */
 		}
-		if (sa->i2sa_events & I2SA_EVT_SOFT_EXPIRE) {
-			sa->i2sa_events &= ~(I2SA_EVT_SOFT_EXPIRE);
+		if (events & I2SA_EVT_SOFT_EXPIRE) {
+			events &= ~(I2SA_EVT_SOFT_EXPIRE);
 			/* TODO: ikev2_sa_soft_expire(sa); */
 		}
-		if (sa->i2sa_events & I2SA_EVT_PKT_XMIT) {
-			sa->i2sa_events &= ~(I2SA_EVT_PKT_XMIT);
+		if (events & I2SA_EVT_PKT_XMIT) {
+			events &= ~(I2SA_EVT_PKT_XMIT);
 			ikev2_retransmit(sa);
 		}
 
-		if (I2SA_QUEUE_EMPTY(sa))
-			break;
-
-		/* Pick off a packet and release the queue */
-		pkt = sa->i2sa_queue[sa->i2sa_queue_end];
-		sa->i2sa_queue[sa->i2sa_queue_end++] = NULL;
-		sa->i2sa_queue_end %= I2SA_QUEUE_DEPTH;
-		mutex_exit(&sa->i2sa_queue_lock);
-
-		if (ikev2_retransmit_check(pkt)) {
-			ikev2_pkt_free(pkt);
-			mutex_exit(&sa->i2sa_lock);
-			mutex_enter(&sa->i2sa_queue_lock);
-			mutex_enter(&sa->i2sa_lock);
-			continue;
+		if (type != I2SA_MSG_NONE) {
+			(void) bunyan_debug(sa->i2sa_log,
+			    "Processing IKE SA message",
+			    BUNYAN_T_STRING, "msgtype", i2sa_msgtype_str(type),
+			    BUNYAN_T_POINTER, "msgdata", data,
+			    BUNYAN_T_END);
 		}
 
-		switch (pkt_header(pkt)->exch_type) {
-		case IKEV2_EXCH_IKE_SA_INIT:
-			ikev2_sa_init_inbound(pkt);
+		switch (type) {
+		case I2SA_MSG_NONE:
 			break;
-		case IKEV2_EXCH_IKE_AUTH:
-		case IKEV2_EXCH_CREATE_CHILD_SA:
-		case IKEV2_EXCH_INFORMATIONAL:
-		case IKEV2_EXCH_IKE_SESSION_RESUME:
-			/* TODO */
-			ikev2_pkt_log(pkt, sa->i2sa_log, BUNYAN_L_INFO,
-			    "Exchange not implemented yet");
-			ikev2_pkt_free(pkt);
+		case I2SA_MSG_PKT:
+			VERIFY3P(((pkt_t *)data)->pkt_sa, !=, NULL);
+			ikev2_dispatch_pkt(data);
 			break;
-		default:
-			ikev2_pkt_log(pkt, sa->i2sa_log,
-			    BUNYAN_L_ERROR, "Unknown IKEv2 exchange");
-			ikev2_pkt_free(pkt);
+		case I2SA_MSG_PFKEY:
+			ikev2_dispatch_pfkey(sa, data);
+			break;
 		}
 
 		mutex_exit(&sa->i2sa_lock);
@@ -587,8 +835,77 @@ ikev2_dispatch(ikev2_sa_t *sa)
 
 	/*
 	 * We enter with i2sa->i2sa_queue_lock held, exit with it held
-	 * as well
 	 */
+}
+
+static void
+ikev2_dispatch_pkt(pkt_t *pkt)
+{
+	if (ikev2_retransmit_check(pkt)) {
+		ikev2_pkt_free(pkt);
+		return;
+	}
+
+	switch (pkt_header(pkt)->exch_type) {
+	case IKEV2_EXCH_IKE_SA_INIT:
+		ikev2_sa_init_inbound(pkt);
+		break;
+	case IKEV2_EXCH_IKE_AUTH:
+	case IKEV2_EXCH_CREATE_CHILD_SA:
+	case IKEV2_EXCH_INFORMATIONAL:
+	case IKEV2_EXCH_IKE_SESSION_RESUME:
+		/* TODO */
+		ikev2_pkt_log(pkt, pkt->pkt_sa->i2sa_log, BUNYAN_L_INFO,
+		    "Exchange not implemented yet");
+		ikev2_pkt_free(pkt);
+		break;
+	default:
+		ikev2_pkt_log(pkt, pkt->pkt_sa->i2sa_log,
+		    BUNYAN_L_ERROR, "Unknown IKEv2 exchange");
+		ikev2_pkt_free(pkt);
+	}
+}
+
+static void
+ikev2_dispatch_pfkey(ikev2_sa_t *restrict sa, parsedmsg_t *restrict pmsg)
+{
+	sadb_msg_t *samsg = pmsg->pmsg_samsg;
+
+	switch (samsg->sadb_msg_type) {
+	case SADB_ACQUIRE:
+		/*
+		 * The first SADB_ACQUIRE message will call
+		 * ikev2_sa_init_outbound() which not only starts the
+		 * IKE_SA_INIT exchange, but also adds the message to
+		 * i2sa->i2sa_pending.
+		 */
+		if (!(sa->flags & I2SA_AUTHENTICATED) &&
+		    list_is_empty(&sa->i2sa_pending)) {
+			ikev2_sa_init_outbound(sa, pmsg);
+		} else {
+			sadb_log(sa->i2sa_log, BUNYAN_L_INFO,
+			    "CREATE_CHILD_SA not implemented yet",
+			    pmsg->pmsg_samsg);
+
+			/* TODO: Start CREATE_CHILD_SA exchange */
+			parsedmsg_free(pmsg);
+			I2SA_REFRELE(sa);
+		}
+		return;
+	case SADB_EXPIRE:
+		/* TODO */
+		sadb_log(sa->i2sa_log, BUNYAN_L_INFO,
+		    "SADB_EXPIRE support not implemented yet; discarding msg",
+		    samsg);
+		parsedmsg_free(pmsg);
+		I2SA_REFRELE(sa);
+		return;
+	default:
+		sadb_log(sa->i2sa_log, BUNYAN_L_ERROR,
+		    "Unexpected SADB request from kernel", samsg);
+		parsedmsg_free(pmsg);
+		I2SA_REFRELE(sa);
+	}
 }
 
 static int

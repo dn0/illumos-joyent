@@ -60,15 +60,27 @@ typedef struct i2sa_bucket i2sa_bucket_t;
 
 struct config_rule_s;
 
-typedef enum i2sa_hash_e {
+typedef enum i2sa_hash {
 	I2SA_LSPI	= 0,
 	I2SA_RHASH	= 1,
 } i2sa_hash_t;
 #define	I2SA_NUM_HASH	2	/* The number of IKEv2 SA hashes we have */
 
 #define	I2SA_SALT_LEN		32	/* Max size of salt, may be smaller */
-#define	I2SA_QUEUE_DEPTH	8	/* How many packets we'll queue */
 
+typedef enum i2sa_msg_type {
+	I2SA_MSG_NONE = 0,
+	I2SA_MSG_PKT,
+	I2SA_MSG_PFKEY,
+} i2sa_msg_type_t;
+
+typedef struct i2sa_msg {
+	i2sa_msg_type_t	i2m_type;
+	void		*i2m_data;
+} i2sa_msg_t;
+#define	I2SA_QUEUE_DEPTH	8	/* How many messages we'll queue */
+
+/* Timer events */
 typedef enum i2sa_evt {
 	I2SA_EVT_NONE		= 0x00,
 	I2SA_EVT_PKT_XMIT	= 0x01,
@@ -93,19 +105,20 @@ struct ikev2_sa_s {
 			 * Logger for this IKEv2 SA.  Set at creation time.
 			 * Nothing should add or remove keys to this.  Can
 			 * be used by any refheld pointer to the SA without
-			 * acquiring i2sa_lock.
+			 * acquiring i2sa_lock (since bunyan does it's own
+			 * locking).
 			 */
 	bunyan_logger_t	*i2sa_log;
 
-			/* Protects queue and events field */
+			/* Protects i2sa_queue_* and i2sa_events fields */
 	mutex_t		i2sa_queue_lock;
-	struct pkt_s	*i2sa_queue[I2SA_QUEUE_DEPTH];
+	i2sa_msg_t	i2sa_queue[I2SA_QUEUE_DEPTH];
 	size_t		i2sa_queue_start;
 	size_t		i2sa_queue_end;
 	i2sa_evt_t	i2sa_events;
 
 			/*
-			 * protects everything else, acquire after
+			 * i2sa_lock protects everything else, acquire after
 			 * i2sa_queue_lock
 			 */
 	mutex_t		i2sa_lock;
@@ -149,7 +162,7 @@ struct ikev2_sa_s {
 	uint32_t	inmsgid;	/* Next expected inbound msgid. */
 
 	periodic_id_t	i2sa_xmit_timer;
-	struct pkt_s	*init_i;  	/* IKE_SA_INIT packet. */
+	struct pkt_s	*init_i;	/* IKE_SA_INIT packet. */
 	struct pkt_s	*init_r;
 	struct pkt_s	*last_resp_sent;
 	struct pkt_s	*last_sent;
@@ -161,6 +174,7 @@ struct ikev2_sa_s {
 	hrtime_t	hardexpire;
 	periodic_id_t	i2sa_hardlife_timer;
 
+	list_t		i2sa_pending;
 	list_t		i2sa_child_sas;
 
 	CK_OBJECT_HANDLE dh_pubkey;
@@ -184,7 +198,6 @@ struct ikev2_sa_s {
 
 struct ikev2_child_sa {
 	list_node_t		i2c_node;
-
 	hrtime_t		i2c_birth;
 	ikev2_spi_proto_t	i2c_satype;
 	uint32_t		i2c_spi;
@@ -234,7 +247,6 @@ struct ikev2_child_sa {
 	((((i2sa)->i2sa_queue_end + 1) % I2SA_QUEUE_DEPTH) == \
 	(i2sa)->i2sa_queue_start)
 
-
 extern size_t ikev2_sa_buckets;		/* Number of HASH buckets */
 
 ikev2_sa_t *ikev2_sa_get(uint64_t, uint64_t,
@@ -248,10 +260,12 @@ ikev2_sa_t *ikev2_sa_alloc(boolean_t, struct pkt_s *restrict,
 void	ikev2_sa_set_remote_spi(ikev2_sa_t *, uint64_t);
 void	ikev2_sa_free(ikev2_sa_t *);
 void	ikev2_sa_condemn(ikev2_sa_t *);
-void	ikev2_sa_p1_expire(ikev2_sa_t *);
 
 void	ikev2_sa_flush(void);
 void	ikev2_sa_set_hashsize(uint_t);
+
+boolean_t ikev2_sa_queuemsg(ikev2_sa_t *, i2sa_msg_type_t, void *);
+const char *i2sa_msgtype_str(i2sa_msg_type_t);
 
 #ifdef  __cplusplus
 }

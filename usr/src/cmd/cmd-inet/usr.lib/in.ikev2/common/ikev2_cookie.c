@@ -273,21 +273,29 @@ done:
 static void
 cookie_update_secret(void *dummy)
 {
+	uint32_t version = 0;
+
 	VERIFY0(rw_wrlock(&i2c_lock));
 
 	if (SECRET_BIRTH(i2c_version) != 0)
 		i2c_version++;
 
+	version = i2c_version;
+
 	arc4random_buf(SECRET(i2c_version), COOKIE_SECRET_LEN);
 	SECRET_BIRTH(i2c_version) = gethrtime();
 
 	VERIFY0(rw_unlock(&i2c_lock));
+
+	(void) bunyan_debug(log, "Created new cookie secret",
+	    BUNYAN_T_UINT32, "version", version, BUNYAN_T_END);
 }
 
 void
 ikev2_cookie_init(void)
 {
 	cookie_update_secret(NULL);
+
 	if (periodic_schedule(wk_periodic, COOKIE_SECRET_LIFETIME, 0,
 	    cookie_update_secret, NULL, &cookie_timer_id) != 0) {
 		err(EXIT_FAILURE, "Could not schedule cookie periodic");
