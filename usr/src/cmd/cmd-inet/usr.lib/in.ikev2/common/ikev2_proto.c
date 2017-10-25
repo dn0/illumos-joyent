@@ -435,6 +435,7 @@ ikev2_send(pkt_t *pkt, boolean_t is_error)
 	free(str);
 	str = NULL;
 
+	VERIFY3U(ntohl(pkt_header(pkt)->length), ==, pkt_len(pkt));
 	s = select_socket(i2sa);
 	len = sendfromto(s, pkt_start(pkt), pkt_len(pkt), &i2sa->laddr,
 	    &i2sa->raddr);
@@ -464,12 +465,20 @@ ikev2_send(pkt_t *pkt, boolean_t is_error)
 	if (!resp) {
 		config_t *cfg = config_get();
 		hrtime_t retry = cfg->cfg_retry_init;
+		int rc;
 
 		CONFIG_REFRELE(cfg);
 
 		i2sa->last_sent = pkt;
-		if (periodic_schedule(wk_periodic, retry, PERIODIC_ONESHOT,
-		    ikev2_retransmit_cb, i2sa, &i2sa->i2sa_xmit_timer) != 0) {
+		mutex_exit(&i2sa->i2sa_lock);
+
+		mutex_enter(&i2sa->i2sa_queue_lock);
+		mutex_enter(&i2sa->i2sa_lock);
+		rc = periodic_schedule(wk_periodic, retry, PERIODIC_ONESHOT,
+		    ikev2_retransmit_cb, i2sa, &i2sa->i2sa_xmit_timer);
+		mutex_exit(&i2sa->i2sa_queue_lock);
+
+		if (rc != 0) {
 			/* XXX: msg */
 			return (B_FALSE);
 		}
@@ -480,9 +489,12 @@ ikev2_send(pkt_t *pkt, boolean_t is_error)
 	 * Normally, we save the last repsonse packet we've sent in order to
 	 * re-send the last response in case the remote system retransmits
 	 * the last exchange it initiated.  However for IKE_SA_INIT exchanges,
-	 * responses of the form HDR(A,0) are not saved, as these should be
-	 * either a request for cookies, a new DH group, or a failed exchange
-	 * (no proposal chosen).
+	 * _responses_ of the form HDR(A,0) are not saved for retransmission.
+	 * These responses should be either a request for cookies, a new DH
+	 * group, or a failed exchange (no proposal chosen), and we will
+	 * want to process the resulting reply (which, if it happens, should
+	 * be a restart of the IKE_SA_INIT exchange with the updated
+	 * parameters).
 	 */
 	if (hdr->exch_type != IKEV2_EXCH_IKE_SA_INIT ||
 	    hdr->responder_spi != 0) {
@@ -505,6 +517,7 @@ ikev2_retransmit_cb(void *data)
 
 	mutex_enter(&sa->i2sa_queue_lock);
 	sa->i2sa_events |= I2SA_EVT_PKT_XMIT;
+	sa->i2sa_xmit_timer = 0;
 	ikev2_dispatch(sa);
 	mutex_exit(&sa->i2sa_queue_lock);
 }
@@ -562,16 +575,25 @@ ikev2_retransmit(ikev2_sa_t *sa)
 	(void) sendfromto(select_socket(sa), pkt_start(pkt), pkt_len(pkt),
 	    &sa->laddr, &sa->raddr);
 
-	if (periodic_schedule(wk_periodic, retry, PERIODIC_ONESHOT,
-	    ikev2_retransmit_cb, sa, &sa->i2sa_xmit_timer) != 0) {
-		if (errno == ENOMEM) {
-			(void) bunyan_error(log,
-			    "No memory to reschedule packet retransmit; "
-			    "deleting IKE SA", BUNYAN_T_END);
-			ikev2_sa_condemn(sa);
-			return;
-		}
+	mutex_exit(&sa->i2sa_lock);
+	mutex_enter(&sa->i2sa_queue_lock);
+	mutex_enter(&sa->i2sa_lock);
 
+	int rc;
+
+	if ((rc = periodic_schedule(wk_periodic, retry, PERIODIC_ONESHOT,
+	    ikev2_retransmit_cb, sa, &sa->i2sa_xmit_timer)) != 0)
+		rc = errno;
+
+	mutex_exit(&sa->i2sa_queue_lock);
+
+	if (rc == ENOMEM) {
+		(void) bunyan_error(log,
+		    "No memory to reschedule packet retransmit; "
+			    "deleting IKE SA", BUNYAN_T_END);
+		ikev2_sa_condemn(sa);
+		return;
+	} else if (rc > 0) {
 		STDERR(fatal, "Unexpected error scheduling packet retransmit");
 		abort();
 	}

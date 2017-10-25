@@ -53,8 +53,7 @@ ikev2_pkt_new_exchange(ikev2_sa_t *i2sa, ikev2_exch_t exch_type)
 
 	VERIFY(MUTEX_HELD(&i2sa->i2sa_lock));
 
-	if (exch_type != IKEV2_EXCH_IKE_SA_INIT)
-		msgid = i2sa->outmsgid++;
+	msgid = i2sa->outmsgid++;
 
 	if (i2sa->flags & I2SA_INITIATOR)
 		flags |= IKEV2_FLAG_INITIATOR;

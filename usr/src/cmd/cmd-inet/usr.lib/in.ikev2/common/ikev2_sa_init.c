@@ -213,8 +213,6 @@ redo_init(pkt_t *pkt)
 	pkt_payload_t *nonce = pkt_get_payload(out, IKEV2_PAYLOAD_NONCE, NULL);
 	ikev2_dh_t dh = IKEV2_DH_NONE;
 
-	sa->init_i = NULL;
-
 	if (invalid_ke != NULL) {
 		if (invalid_ke->pn_len != sizeof (uint16_t)) {
 			/*
@@ -234,8 +232,38 @@ redo_init(pkt_t *pkt)
 		uint16_t val = BE_IN16(invalid_ke->pn_ptr);
 		dh = val;
 	}
+
+	/*
+	 * If we're restarting the IKE_SA_INIT exchange, we must always start
+	 * with msgid 0, and our last response should be the initiator init
+	 * packet.  Reset those and restart.
+	 */
+	VERIFY3P(sa->last_sent, ==, sa->init_i);
+	sa->init_i = sa->last_sent = NULL;
+	sa->outmsgid = 0;
+
+	/*
+	 * The callback for the retransmit timer acquires i2sa_queue_lock to
+	 * post the event.  We will deadlock if it fires in another thread
+	 * while attempting to cancel it if we hold i2sa_queue_lock.
+	 */
+	VERIFY(!MUTEX_HELD(&sa->i2sa_queue_lock));
 	(void) periodic_cancel(wk_periodic, sa->i2sa_xmit_timer);
+
+	/*
+	 * We should be pinned, so we should be able to reacquire queue and
+	 * i2sa locks.  We explicitly clear the retransmit flag in i2sa_events
+	 * in case it happened to fire while we are in the process of
+	 * reattempting the IKE_SA_INIT exchange with new parameters.
+	 */
+	VERIFY3U(sa->i2sa_tid, ==, thr_self());
+	mutex_exit(&sa->i2sa_lock);
+	mutex_enter(&sa->i2sa_queue_lock);
+	mutex_enter(&sa->i2sa_lock);
 	sa->i2sa_xmit_timer = 0;
+	sa->flags &= ~(I2SA_EVT_PKT_XMIT);
+	mutex_exit(&sa->i2sa_queue_lock);
+
 	do_sa_init_outbound(sa, cookie->pn_ptr, cookie->pn_len,
 	    dh, nonce->pp_ptr, nonce->pp_len);
 

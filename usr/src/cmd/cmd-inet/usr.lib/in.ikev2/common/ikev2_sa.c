@@ -324,13 +324,17 @@ i2sa_p1_expire(void *data)
 	ikev2_sa_t *i2sa = data;
 	int rc;
 
+	mutex_enter(&i2sa->i2sa_queue_lock);
+
 	key_add_ike_spi(LOG_KEY_LSPI, I2SA_LOCAL_SPI(i2sa));
 	key_add_ike_spi(LOG_KEY_RSPI, I2SA_REMOTE_SPI(i2sa));
 	(void) bunyan_info(log, "Larval IKE SA timeout", BUNYAN_T_END);
 
-	mutex_enter(&i2sa->i2sa_queue_lock);
 	i2sa->i2sa_events |= I2SA_EVT_P1_EXPIRE;
+	i2sa->i2sa_p1_timer = 0;
+
 	ikev2_dispatch(i2sa);
+
 	mutex_exit(&i2sa->i2sa_queue_lock);
 
 	(void) bunyan_key_remove(log, LOG_KEY_LSPI);
@@ -344,6 +348,25 @@ ikev2_sa_flush(void)
 	/* TODO: implement me */
 }
 
+/*
+ * Condemning an IKEv2 SA is somewhat complicated.  If the IKEv2 SA has not
+ * yet been authenticated, we can completely tear it down and release it
+ * when we condemn it.  However, once the IKEv2 SA has been authenticated, we
+ * cannot tear it down completely once we've condemned it.  For example, if
+ * during the IKE_AUTH exchange we successfully authenticate our peer, but
+ * cannot establish the accompanying child SA for whatever reason, we cannot
+ * immediately tear down the IKE SA -- a separate INFORMATIONAL exchange must
+ * take place to delete the IKE SA.  If we initiate the exchange, we will also
+ * want to wait up to the timeout for a reply, so we must be able to
+ * still process replies.
+ *
+ * As such, once the IKEv2 SA has been authenticated, condemnation is a two
+ * step process.   The first step will merely set the I2SA_CONDEMNED flag
+ * which will indicate that any new requests to this IKEv2 SA from the kernel
+ * as well as attempts for new work should be rejected.  Once any necessary
+ * exchanges are complete, ikev2_sa_condemn is called once again to complete
+ * tearing down the IKEv2 SA.
+ */
 void
 ikev2_sa_condemn(ikev2_sa_t *i2sa)
 {
@@ -351,41 +374,92 @@ ikev2_sa_condemn(ikev2_sa_t *i2sa)
 
 	VERIFY(!MUTEX_HELD(&i2sa->i2sa_queue_lock));
 	VERIFY(MUTEX_HELD(&i2sa->i2sa_lock));
+	VERIFY3U(i2sa->i2sa_tid, ==, thr_self());
 
 	(void) bunyan_info(log, "Condemning IKE SA", BUNYAN_T_END);
-	i2sa->flags |= I2SA_CONDEMNED;
+
+	if (!(i2sa->flags & I2SA_CONDEMNED) &&
+	    (i2sa->flags & I2SA_AUTHENTICATED)) {
+		i2sa->flags |= I2SA_CONDEMNED;
+		return;
+	}
 
 	I2SA_REFHOLD(i2sa);
 	i2sa_unlink(i2sa);
 
 	mutex_exit(&i2sa->i2sa_lock);
-	mutex_enter(&i2sa->i2sa_queue_lock);
-	mutex_enter(&i2sa->i2sa_lock);
 
-	/* If we havent seen these fire yet, cancel them */
-	if (i2sa->i2sa_xmit_timer != 0 &&
-	    !(i2sa->i2sa_events & I2SA_EVT_PKT_XMIT)) {
-		VERIFY0(periodic_cancel(wk_periodic, i2sa->i2sa_xmit_timer));
-	}
-	if (i2sa->i2sa_p1_timer != 0 &&
-	    !(i2sa->i2sa_events & I2SA_EVT_P1_EXPIRE)) {
-		VERIFY0(periodic_cancel(wk_periodic, i2sa->i2sa_p1_timer));
-	}
-	if (i2sa->i2sa_softlife_timer != 0 &&
-	    !(i2sa->i2sa_events & I2SA_EVT_SOFT_EXPIRE)) {
-		VERIFY0(periodic_cancel(wk_periodic,
-		    i2sa->i2sa_softlife_timer));
-	}
-	if (i2sa->i2sa_hardlife_timer != 0 &&
-	    !(i2sa->i2sa_events & I2SA_EVT_HARD_EXPIRE)) {
-		(void) periodic_cancel(wk_periodic, i2sa->i2sa_hardlife_timer);
-	}
+	/*
+	 * Tearing down the timers is a bit tricky.  All of our IKEv2 SA
+	 * timers are one-shot.  When they fire (which can be from any
+	 * thread), invoke a callback which must acquire i2sa_queue_lock to
+	 * post the event to the IKEv2 SA.  If we call periodic_cancel() while
+	 * a particular timer for this IKEv2 SA is firing on another thread,
+	 * the periodic_cancel() call will block until after the callback
+	 * has completed (and then return success).  Thus to cancel them, we
+	 * must invoke periodic_cancel() without holding i2sa_queue_lock to
+	 * prevent deadlocks.  Once periodic_cancel() returns, we know that
+	 * the timer has either been canceled or has fired.  Since
+	 * each timer also holds a reference to the IKEv2 SA, we must then
+	 * check to see if any particular timer has fired and release any
+	 * references if it has not fired--all the callbacks should
+	 * release their references at the end of their callbacks unless they
+	 * are rescheduling themselves (e.g. the retransmit timer).
+	 */
+	mutex_enter(&i2sa->i2sa_queue_lock);
+
+	/*
+	 * Once the timer fires, it clears it's respective id in ikev2_sa_t,
+	 * so we need to grab our own local copy before releasing
+	 * i2sa_queue_lock.  Technically, this isn't 100% correct -- it's
+	 * possible that between copying this id, and running periodic_cancel()
+	 * on it, that the timer fires, and the id is recycled and used for
+	 * another timeout.  Unfortunately, there is no way to get around this
+	 * to cancel a timeout.  In practice however, libperiodic uses an
+	 * id_space_t to pick new ids, which should always allocate id values
+	 * greater than perviously allocated ids (until it wraps around).  As
+	 * long as the id space used does not wrap around in the time between
+	 * taking a local copy of the periodic_id_t and calling
+	 * periodic_cancel(), this shouldn't cause a problem.  Given the size
+	 * of the id space [1, INT32_MAX], and how quickly we read the timer id
+	 * and then call periodic_cancel, this shouldn't ever actually happen.
+	 */
+	periodic_id_t xmit = i2sa->i2sa_xmit_timer;
+	periodic_id_t p1 = i2sa->i2sa_p1_timer;
+	periodic_id_t soft = i2sa->i2sa_softlife_timer;
+	periodic_id_t hard = i2sa->i2sa_hardlife_timer;
+
+	mutex_exit(&i2sa->i2sa_queue_lock);
+
+	/* If these fail, it should only be because it just fired */
+	if (xmit != 0 && periodic_cancel(wk_periodic, xmit) != 0)
+		VERIFY3S(errno, ==, ENOENT);
+	if (p1 != 0 && periodic_cancel(wk_periodic, p1) != 0)
+		VERIFY3S(errno, ==, ENOENT);
+	if (soft != 0 && periodic_cancel(wk_periodic, soft) != 0)
+		VERIFY3S(errno, ==, ENOENT);
+	if (hard != 0 && periodic_cancel(wk_periodic, hard) != 0)
+		VERIFY3S(errno, ==, ENOENT);
+
+	mutex_enter(&i2sa->i2sa_queue_lock);
+
+	/*
+	 * For events that didn't fire (thus clearing their ids) while we
+	 * attempted to cancel them, release the references they held.
+	 * For i2sa_xmit_timer, the reference is held by i2sa->last_sent,
+	 * and will be released when that is freed.
+	 */
+	if (p1 !=0 && i2sa->i2sa_p1_timer != 0)
+		I2SA_REFRELE(i2sa);
+	if (soft != 0 && i2sa->i2sa_softlife_timer != 0)
+		I2SA_REFRELE(i2sa);
+	if (hard != 0 && i2sa->i2sa_hardlife_timer != 0)
+		I2SA_REFRELE(i2sa);
 
 	i2sa->i2sa_p1_timer = i2sa->i2sa_softlife_timer =
 	    i2sa->i2sa_xmit_timer = i2sa->i2sa_hardlife_timer = 0;
 
-	/* Drop the queue lock so any pending activity can drain */
-	mutex_exit(&i2sa->i2sa_queue_lock);
+	mutex_enter(&i2sa->i2sa_lock);
 
 	/*
 	 * Since packets keep a reference to the SA they are associated with,
@@ -394,18 +468,20 @@ ikev2_sa_condemn(ikev2_sa_t *i2sa)
 	if (i2sa->init_i != i2sa->last_resp_sent &&
 	    i2sa->init_i != i2sa->last_sent)
 		ikev2_pkt_free(i2sa->init_i);
+	i2sa->init_i = NULL;
 
 	if (i2sa->init_r != i2sa->last_resp_sent &&
 	    i2sa->init_r != i2sa->last_sent)
 		ikev2_pkt_free(i2sa->init_r);
+	i2sa->init_r = NULL;
 
 	ikev2_pkt_free(i2sa->last_resp_sent);
-	ikev2_pkt_free(i2sa->last_sent);
-	ikev2_pkt_free(i2sa->last_recvd);
-	i2sa->init_i = NULL;
-	i2sa->init_r = NULL;
 	i2sa->last_resp_sent = NULL;
+
+	ikev2_pkt_free(i2sa->last_sent);
 	i2sa->last_sent = NULL;
+
+	ikev2_pkt_free(i2sa->last_recvd);
 	i2sa->last_recvd = NULL;
 
 	pmsg = list_head(&i2sa->i2sa_pending);
