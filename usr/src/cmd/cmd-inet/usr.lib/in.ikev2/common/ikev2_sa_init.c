@@ -50,6 +50,7 @@ void
 ikev2_sa_init_inbound(pkt_t *pkt)
 {
 	VERIFY(IS_WORKER);
+	VERIFY(!MUTEX_HELD(&pkt->pkt_sa->i2sa_queue_lock));
 	VERIFY(MUTEX_HELD(&pkt->pkt_sa->i2sa_lock));
 
 	if (pkt_header(pkt)->flags & IKEV2_FLAG_INITIATOR) {
@@ -264,6 +265,10 @@ redo_init(pkt_t *pkt)
 	sa->flags &= ~(I2SA_EVT_PKT_XMIT);
 	mutex_exit(&sa->i2sa_queue_lock);
 
+	(void) bunyan_debug(log,
+	    "Response requested new parameters; restarting exchange",
+	    BUNYAN_T_END);
+
 	do_sa_init_outbound(sa, cookie->pn_ptr, cookie->pn_len,
 	    dh, nonce->pp_ptr, nonce->pp_len);
 
@@ -282,6 +287,12 @@ ikev2_sa_init_inbound_resp(pkt_t *pkt)
 	pkt_payload_t *ke_r = pkt_get_payload(pkt, IKEV2_PAYLOAD_KE, NULL);
 	ikev2_sa_result_t sa_result = { 0 };
 	ikev2_auth_type_t authmethod;
+
+	VERIFY(!MUTEX_HELD(&sa->i2sa_queue_lock));
+	VERIFY(MUTEX_HELD(&sa->i2sa_lock));
+
+	(void) bunyan_debug(log, "Processing IKE_SA_INIT response",
+	     BUNYAN_T_END);
 
 	if (pkt_get_notify(pkt, IKEV2_N_NO_PROPOSAL_CHOSEN, NULL) != NULL) {
 		(void) bunyan_error(log,

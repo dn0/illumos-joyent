@@ -264,6 +264,9 @@ void	ikev2_sa_condemn(ikev2_sa_t *);
 void	ikev2_sa_flush(void);
 void	ikev2_sa_set_hashsize(uint_t);
 
+void ikev2_sa_post_event(ikev2_sa_t *, i2sa_evt_t);
+boolean_t ikev2_sa_arm_timer(ikev2_sa_t *, i2sa_evt_t, hrtime_t);
+boolean_t ikev2_sa_disarm_timer(ikev2_sa_t *, i2sa_evt_t);
 boolean_t ikev2_sa_queuemsg(ikev2_sa_t *, i2sa_msg_type_t, void *);
 const char *i2sa_msgtype_str(i2sa_msg_type_t);
 
