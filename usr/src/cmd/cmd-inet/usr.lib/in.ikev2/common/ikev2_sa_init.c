@@ -869,6 +869,16 @@ create_skeyseed(ikev2_sa_t *restrict sa, CK_OBJECT_HANDLE nonce,
 		goto fail;
 	}
 
+	{
+		char *outbuf = NULL;
+		size_t buflen = skeyseed_len * 2 + 1;
+
+		outbuf = umem_zalloc(buflen, UMEM_NOFAIL);
+		writehex(skeyseed, skeyseed_len, NULL, outbuf, buflen);
+		fprintf(stderr, "SKEYSEED: %s\n", outbuf);
+		umem_free(outbuf, buflen);
+	}
+
 	rc = SUNW_C_KeyToObject(h, ikev2_prf_to_p11(sa->prf), skeyseed,
 	    skeyseed_len, keyp);
 	explicit_bzero(skeyseed, skeyseed_len);
