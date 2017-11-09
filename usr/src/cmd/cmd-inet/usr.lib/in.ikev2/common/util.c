@@ -15,6 +15,7 @@
 
 #include <arpa/inet.h>
 #include <dlfcn.h>
+#include <inet/ip.h>	/* for IP[V6]_ABITS */
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <port.h>
@@ -364,6 +365,96 @@ writehex(uint8_t *data, size_t datalen, char *sep, char *buf, size_t buflen)
 	}
 
 	return (buf);
+}
+
+/*
+ * Giving a starting address and prefix, set end to the last address in the
+ * subnet.
+ */
+void
+last_addr(const struct sockaddr_storage *start, uint8_t prefixlen,
+   struct sockaddr_storage *end)
+{
+	uint8_t *addr = (uint8_t *)end;
+	size_t len = 0;
+
+	switch (start->ss_family) {
+	case AF_INET:
+		VERIFY3U(prefixlen, <=, IP_ABITS);
+		len = sizeof (struct sockaddr_in);
+		addr += offsetof(struct sockaddr_in, sin_addr);
+		addr += len;
+		prefixlen = IP_ABITS - prefixlen;
+		break;
+	case AF_INET6:
+		VERIFY3U(prefixlen, <=, IPV6_ABITS);
+		len = sizeof (struct sockaddr_in6);
+		addr += offsetof(struct sockaddr_in6, sin6_addr);
+		addr += len;
+		prefixlen = IPV6_ABITS - prefixlen;
+		break;
+	default:
+		INVALID(start->ss_family);
+	}
+
+	if (start != end)
+		(void) memcpy(end, start, len);
+
+	while (prefixlen > 0) {
+		if (prefixlen >= 8) {
+			*addr-- = 0xFF;
+			prefixlen -= 8;
+			continue;
+		}
+
+		*addr |= 1 << (prefixlen - 1);
+		prefixlen--;
+	}
+}
+
+void
+addr_to_net(const struct sockaddr_storage *src, uint8_t prefixlen,
+    struct sockaddr_storage *end)
+{
+	const uint8_t *srcp = (const uint8_t *)src;
+	uint8_t *endp = (uint8_t *)end;
+	size_t len = 0;
+	uint8_t mask = 0;
+
+	switch (src->ss_family) {
+	case AF_INET:
+		VERIFY3U(prefixlen, <=, IP_ABITS);
+		len = sizeof (struct sockaddr_in);
+		srcp += offsetof(struct sockaddr_in, sin_addr);
+		endp += offsetof(struct sockaddr_in, sin_addr);
+		break;
+	case AF_INET6:
+		VERIFY3U(prefixlen, <=, IPV6_ABITS);
+		len = sizeof (struct sockaddr_in6);
+		srcp += offsetof(struct sockaddr_in6, sin6_addr);
+		endp += offsetof(struct sockaddr_in6, sin6_addr);
+		break;
+	default:
+		INVALID(src->ss_family);
+	}
+
+	if (src != end) {
+		(void) memcpy(end, src, len);
+		(void) memset(endp, 0, len);
+	}
+
+	while (prefixlen > 0) {
+		if (prefixlen >= 8) {
+			*endp++ = *srcp++;
+			prefixlen -=8;
+			continue;
+		}
+
+		mask |= 1 << (8 - prefixlen);
+		prefixlen--;
+	}
+
+	*endp = *srcp & mask;
 }
 
 /* inline parking lot */

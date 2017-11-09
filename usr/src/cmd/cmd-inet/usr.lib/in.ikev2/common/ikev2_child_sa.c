@@ -43,11 +43,12 @@ struct child_sa_args {
 
 static void ikev2_create_child_sa_init_common(ikev2_sa_t *restrict,
     pkt_t *restrict req, struct child_sa_args *restrict);
-static void ikev2_create_child_sa_init_resp(ikev2_sa_t *restrict,
-    pkt_t *restrict, void *restrict);
 static boolean_t create_keymat(ikev2_sa_t *restrict, uint8_t *restrict, size_t,
     uint8_t *restrict, size_t, prfp_t *restrict);
 static uint8_t get_satype(parsedmsg_t *);
+static boolean_t ikev2_create_child_sas(ikev2_sa_t *restrict,
+    struct child_sa_args *restrict, boolean_t);
+static boolean_t add_ts_init(pkt_t *restrict, parsedmsg_t *restrict);
 
 void
 ikev2_create_child_sa_init_auth(ikev2_sa_t *restrict sa, pkt_t *restrict req,
@@ -98,6 +99,9 @@ ikev2_create_child_sa_init(ikev2_sa_t *restrict sa, parsedmsg_t *restrict pmsg)
 	VERIFY(IS_WORKER);
 	VERIFY(!MUTEX_HELD(&sa->i2sa_queue_lock));
 	VERIFY(MUTEX_HELD(&sa->i2sa_lock));
+
+	(void) bunyan_debug(log, "Starting CREATE_CHILD_SA exchange",
+	    BUNYAN_T_END);
 
 	csa = umem_zalloc(sizeof (*csa), UMEM_DEFAULT);
 	if (csa == NULL) {
@@ -181,13 +185,16 @@ ikev2_create_child_sa_init_common(ikev2_sa_t *restrict sa, pkt_t *restrict req,
 		csa->csa_nonce_i_len = nonce->pp_len;
 	}
 
-	/* TSi / TSr */
+	if (!add_ts_init(req, pmsg))
+		goto fail;
 
 	if (!ikev2_send_req(req, ikev2_create_child_sa_init_resp, csa))
 		goto fail;
 
+	return;
+
 fail:
-	(void) pfkey_delete(csa->csa_local_spi, src, dest, B_FALSE);
+	(void) pfkey_delete(satype, csa->csa_local_spi, src, dest, B_FALSE);
 	explicit_bzero(csa, sizeof (*csa));
 	umem_free(csa, sizeof (*csa));
 	ikev2_pkt_free(req);
@@ -358,8 +365,14 @@ fail:
 	ikev2_pkt_free(resp);
 }
 
-/* We are initiator, this is the response from the peer */
-static void
+/*
+ * We are initiator, this is the response from the peer.
+ *
+ * NOTE: Unlike the analogous functions in other exchanges, this one is
+ * not static since in the case of an IKE_AUTH exchange, we chain this
+ * function after doing the IKE_AUTH specific handling.
+ */
+void
 ikev2_create_child_sa_init_resp(ikev2_sa_t *restrict i2sa,
     pkt_t *restrict resp, void *restrict arg)
 {
@@ -425,7 +438,8 @@ ikev2_create_child_sa_init_resp(ikev2_sa_t *restrict i2sa,
 			goto fail;
 	}
 
-	/* TODO: Create child SA */
+	if (!ikev2_create_child_sas(i2sa, csa, B_TRUE))
+		goto fail;
 
 	return;
 
@@ -450,6 +464,87 @@ remote_fail:
 	ikev2_pkt_free(resp);
 }
 
+/*
+ * This takes a pf_key(7P) sadb_address extension and converts it into
+ * an IKEv2 traffic selector that is added to the TS{i,r} payload being
+ * constructed using tstate.
+ *
+ * An sadb_address consists of an IPv4 or IPv6 address and port, a protocol
+ * (TCP, UDP, etc.), and a prefix length. There currently is no way to express
+ * a range of ports -- either a specific port is given or 0 for any.  To
+ * translate to an IKEv2 traffic selector, we merely use the prefix length to
+ * map the address into a subnet range, and then either use the single port
+ * or 0-UINT16_MAX for the port range (if 0 was given for the port).
+ */
+static boolean_t
+add_sadb_address(ikev2_pkt_ts_state_t *restrict tstate,
+    const sadb_address_t *restrict addr)
+{
+	struct sockaddr_storage ss_start = { 0 };
+	struct sockaddr_storage ss_end = { 0 };
+	sockaddr_u_t start = { .sau_ss = &ss_end };
+	sockaddr_u_t end = { .sau_ss = &ss_end };
+	uint8_t proto = addr->sadb_address_proto;
+
+	addr_to_net((struct sockaddr_storage *)(addr + 1),
+	    addr->sadb_address_prefixlen, start.sau_ss);
+
+	last_addr(start.sau_ss, addr->sadb_address_prefixlen, end.sau_ss);
+
+	/*
+	 * Take advantage of sin_port and sin6_port residing at the same
+	 * offset, and that htons(UINT16_MAX) == UINT16_MAX for both
+	 * big and little endian machines.
+	 */
+	if (start.sau_sin->sin_port == 0)
+		end.sau_sin->sin_port = UINT16_MAX;
+
+	return (ikev2_add_ts(tstate, proto, start.sau_ss, end.sau_ss));
+}
+
+static boolean_t
+add_ts_init(pkt_t *restrict pkt, parsedmsg_t *restrict pmsg)
+{
+	ikev2_pkt_ts_state_t tstate = { 0 };
+	sadb_address_t *addr = NULL;
+
+	if (!ikev2_add_ts_i(pkt, &tstate))
+		return (B_FALSE);
+
+#ifdef notyet
+	addr = (sadb_address_t *)pmsg->pmsg_exts[SADB_X_EXT_ADDRESS_OPS];
+	if (addr != NULL && !add_sadb_address(&tstate, addr))
+		return (B_FALSE);
+#endif
+
+	addr = (sadb_address_t *)pmsg->pmsg_exts[SADB_X_EXT_ADDRESS_INNER_SRC];
+	if (addr == NULL)
+		addr = (sadb_address_t *)pmsg->pmsg_exts[SADB_EXT_ADDRESS_SRC];
+
+	if (!add_sadb_address(&tstate, addr))
+		return (B_FALSE);
+
+	(void) memset(&tstate, 0, sizeof (tstate));
+	if (!ikev2_add_ts_r(pkt, &tstate))
+		return (B_FALSE);
+
+#ifdef notyet
+	addr = (sadb_address_t *)pmsg->pmsg_exts[SADB_X_EXT_ADDRESS_OPD];
+	if (addr != NULL && !add_sadb_address(&tstate, addr))
+		return (B_FALSE);
+#endif
+
+	addr = (sadb_address_t *)pmsg->pmsg_exts[SADB_X_EXT_ADDRESS_INNER_DST];
+	if (addr == NULL)
+		addr = (sadb_address_t *)pmsg->pmsg_exts[SADB_EXT_ADDRESS_DST];
+
+	if (!add_sadb_address(&tstate, addr))
+		return (B_FALSE);
+
+	return (B_TRUE);
+}
+
+/* Sends the pf_key(7P) messages to establish the IPsec SAs */
 static boolean_t
 ikev2_create_child_sas(ikev2_sa_t *restrict sa,
     struct child_sa_args *restrict csa, boolean_t initiator)

@@ -80,8 +80,8 @@ ikev2_ike_auth_init(ikev2_sa_t *restrict sa, parsedmsg_t *restrict pmsg)
 	if (!add_auth(req))
 		goto fail;
 
-#if 0
-	ikev2_create_child_sa_outbound(sa, req);
+#if 1
+	ikev2_create_child_sa_init_auth(sa, req, pmsg);
 #else
 	ikev2_send_req(req, ikev2_ike_auth_init_resp, pmsg);
 #endif
@@ -189,8 +189,8 @@ ikev2_ike_auth_resp(pkt_t *req)
 	if (!add_auth(resp))
 		goto fail;
 
-#if 0
-	ikev2_create_child_sa_inbound(req, resp);
+#if 1
+	ikev2_create_child_sa_resp(req, resp);
 #else
 	ikev2_send_resp(resp);
 	ikev2_pkt_free(req);
@@ -225,7 +225,6 @@ ikev2_ike_auth_init_resp(ikev2_sa_t *restrict sa, pkt_t *restrict resp,
 	VERIFY(IS_WORKER);
 	VERIFY(MUTEX_HELD(&resp->pkt_sa->i2sa_lock));
 
-	parsedmsg_t *restrict pmsg = arg;
 	config_id_t *cid_r = NULL;
 	const char *mstr = NULL;
 	char mbuf[IKEV2_ENUM_STRLEN] = { 0 };
@@ -275,8 +274,8 @@ ikev2_ike_auth_init_resp(ikev2_sa_t *restrict sa, pkt_t *restrict resp,
 	if (ikev2_sa_disarm_timer(sa, I2SA_EVT_P1_EXPIRE))
 		I2SA_REFRELE(sa);
 
-#if 0
-	ikev2_create_child_sa_inbound(resp, NULL);
+#if 1
+	ikev2_create_child_sa_init_resp(sa, resp, arg);
 #else
 	ikev2_pkt_free(resp);
 	return;

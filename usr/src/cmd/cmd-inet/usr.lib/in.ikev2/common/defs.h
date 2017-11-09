@@ -208,6 +208,11 @@ struct config_id_s;
 void key_add_id(const char *, const char *, struct config_id_s *);
 char *writehex(uint8_t *, size_t, char *, char *, size_t);
 
+void last_addr(const struct sockaddr_storage *, uint8_t,
+    struct sockaddr_storage *);
+void addr_to_net(const struct sockaddr_storage *, uint8_t,
+    struct sockaddr_storage *);
+
 #ifdef  __cplusplus
 }
 #endif
