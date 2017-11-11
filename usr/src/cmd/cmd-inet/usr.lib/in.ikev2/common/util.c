@@ -17,9 +17,11 @@
 #include <dlfcn.h>
 #include <inet/ip.h>	/* for IP[V6]_ABITS */
 #include <inttypes.h>
+#include <libinetutil.h>
 #include <netinet/in.h>
 #include <port.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <thread.h>
@@ -367,94 +369,220 @@ writehex(uint8_t *data, size_t datalen, char *sep, char *buf, size_t buflen)
 	return (buf);
 }
 
-/*
- * Giving a starting address and prefix, set end to the last address in the
- * subnet.
- */
 void
-last_addr(const struct sockaddr_storage *start, uint8_t prefixlen,
-   struct sockaddr_storage *end)
+net_to_range(const struct sockaddr_storage *addr, uint8_t prefixlen,
+    struct sockaddr_storage *start, struct sockaddr_storage *end)
 {
-	uint8_t *addr = (uint8_t *)end;
+	struct sockaddr_storage mask = { 0 };
+	const uint8_t *addrp = NULL;
+	uint8_t *maskp = NULL, *startp = NULL, *endp = NULL;
 	size_t len = 0;
+	offset_t off = 0;
 
-	switch (start->ss_family) {
+	VERIFY0(plen2mask(prefixlen, addr->ss_family,
+	    (struct sockaddr *)&mask));
+
+	switch (addr->ss_family) {
 	case AF_INET:
-		VERIFY3U(prefixlen, <=, IP_ABITS);
-		len = sizeof (struct sockaddr_in);
-		addr += offsetof(struct sockaddr_in, sin_addr);
-		addr += len;
-		prefixlen = IP_ABITS - prefixlen;
+		len = sizeof (in_addr_t);
+		off = offsetof(struct sockaddr_in, sin_addr);
+		if (start != NULL)
+			bcopy(addr, start, sizeof (struct sockaddr_in));
+		if (end != NULL)
+			bcopy(addr, end, sizeof (struct sockaddr_in));
 		break;
 	case AF_INET6:
-		VERIFY3U(prefixlen, <=, IPV6_ABITS);
-		len = sizeof (struct sockaddr_in6);
-		addr += offsetof(struct sockaddr_in6, sin6_addr);
-		addr += len;
-		prefixlen = IPV6_ABITS - prefixlen;
+		len = sizeof (in6_addr_t);
+		off = offsetof(struct sockaddr_in6, sin6_addr);
+		if (start != NULL)
+			bcopy(addr, start, sizeof (struct sockaddr_in6));
+		if (end != NULL)
+			bcopy(addr, end, sizeof (struct sockaddr_in6));
 		break;
 	default:
-		INVALID(start->ss_family);
+		INVALID(addr->ss_family);
 	}
 
-	if (start != end)
-		(void) memcpy(end, start, len);
+	addrp = (const uint8_t *)addr + off;
+	maskp = (uint8_t *)&mask + off;
+	if (start != NULL)
+		startp = (uint8_t *)start + off;
+	if (end != NULL)
+		endp = (uint8_t *)end + off;
 
-	while (prefixlen > 0) {
-		if (prefixlen >= 8) {
-			*addr-- = 0xFF;
-			prefixlen -= 8;
-			continue;
-		}
-
-		*addr |= 1 << (prefixlen - 1);
-		prefixlen--;
+	for (size_t i = 0; i < len; i++) {
+		if (startp != NULL)
+			startp[i] = addrp[i] & maskp[i];
+		if (endp != NULL)
+			endp[i] = addrp[i] | ~maskp[i];
 	}
 }
 
 void
-addr_to_net(const struct sockaddr_storage *src, uint8_t prefixlen,
-    struct sockaddr_storage *end)
+range_intersection(struct sockaddr_storage *restrict res_start,
+    struct sockaddr_storage *restrict res_end,
+    const struct sockaddr_storage *restrict start1,
+    const struct sockaddr_storage *restrict end1,
+    const struct sockaddr_storage *restrict start2,
+    const struct sockaddr_storage *restrict end2)
 {
-	const uint8_t *srcp = (const uint8_t *)src;
-	uint8_t *endp = (uint8_t *)end;
+	const uint8_t *s1, *s2, *e1, *e2;
+	uint8_t *rs, *re;
 	size_t len = 0;
-	uint8_t mask = 0;
+	offset_t off = 0;
 
-	switch (src->ss_family) {
+	VERIFY3U(start1->ss_family, ==, end1->ss_family);
+	VERIFY3U(start2->ss_family, ==, end2->ss_family);
+	VERIFY3U(start1->ss_family, ==, start2->ss_family);
+
+	switch (start1->ss_family) {
 	case AF_INET:
-		VERIFY3U(prefixlen, <=, IP_ABITS);
-		len = sizeof (struct sockaddr_in);
-		srcp += offsetof(struct sockaddr_in, sin_addr);
-		endp += offsetof(struct sockaddr_in, sin_addr);
+		len = sizeof (in_addr_t);
+		off = offsetof(struct sockaddr_in, sin_addr);
 		break;
 	case AF_INET6:
-		VERIFY3U(prefixlen, <=, IPV6_ABITS);
-		len = sizeof (struct sockaddr_in6);
-		srcp += offsetof(struct sockaddr_in6, sin6_addr);
-		endp += offsetof(struct sockaddr_in6, sin6_addr);
+		len = sizeof (in6_addr_t);
+		off = offsetof(struct sockaddr_in6, sin6_addr);
 		break;
 	default:
-		INVALID(src->ss_family);
+		INVALID(addr->ss_family);
 	}
 
-	if (src != end) {
-		(void) memcpy(end, src, len);
-		(void) memset(endp, 0, len);
+	s1 = (const uint8_t *)start1 + off;
+	e1 = (const uint8_t *)end1 + off;
+	s2 = (const uint8_t *)start2 + off;
+	e2 = (const uint8_t *)end2 + off;
+	rs = (uint8_t *)res_start + off;
+	re = (uint8_t *)res_end + off;
+
+	bzero(rs, len);
+	bzero(re, len);
+
+	for (size_t i = 0; i < len; i++) {
+		rs[i] = MAX(s1[i], s2[i]);
+		re[i] = MIN(e1[i], e2[i]);
 	}
 
-	while (prefixlen > 0) {
-		if (prefixlen >= 8) {
-			*endp++ = *srcp++;
-			prefixlen -=8;
-			continue;
+	/* If end < start, there is no intersection, so zero out */
+	for (size_t i = 0; i < len; i++) {
+		if (re[i] < rs[i]) {
+			bzero(rs, len);
+			bzero(re, len);
+			break;
 		}
+	}
+}
 
-		mask |= 1 << (8 - prefixlen);
-		prefixlen--;
+int
+range_cmp_size(const struct sockaddr_storage *l_start,
+    const struct sockaddr_storage *l_end,
+    const struct sockaddr_storage *r_start,
+    const struct sockaddr_storage *r_end)
+{
+	const uint8_t *lsp, *lep, *rsp, *rep;
+	size_t len = 0;
+	offset_t off = 0;
+
+	VERIFY3U(l_start->ss_family, ==, l_end->ss_family);
+	VERIFY3U(r_start->ss_family, ==, r_end->ss_family);
+	VERIFY3U(l_start->ss_family, ==, r_start->ss_family);
+
+	switch (l_start->ss_family) {
+	case AF_INET:
+		len = sizeof (in_addr_t);
+		off = offsetof(struct sockaddr_in, sin_addr);
+		break;
+	case AF_INET6:
+		len = sizeof (in6_addr_t);
+		off = offsetof(struct sockaddr_in6, sin6_addr);
+		break;
+	default:
+		INVALID(addr->ss_family);
 	}
 
-	*endp = *srcp & mask;
+	lsp = (const uint8_t *)l_start + off;
+	lep = (const uint8_t *)l_end + off;
+	rsp = (const uint8_t *)r_start + off;
+	rep = (const uint8_t *)r_end + off;
+
+	for (size_t i = 0; i < len; i++) {
+		VERIFY3U(lep[i], >=, lsp[i]);
+		VERIFY3U(rep[i], >=, rsp[i]);
+
+		uint8_t l_diff = lep[i] - lsp[i];
+		uint8_t r_diff = rep[i] - rep[i];
+
+		if (l_diff > r_diff)
+			return (-1);
+		if (l_diff < r_diff)
+			return (1);
+	}
+
+	return (0);
+}
+
+/*
+ * Adjust end if necessary so that [start, end] can be expressed as
+ * start/mask
+ */
+void
+range_clamp(struct sockaddr_storage *restrict start,
+    struct sockaddr_storage *restrict end)
+{
+
+}
+
+boolean_t
+range_is_zero(const struct sockaddr_storage *start,
+    const struct sockaddr_storage *end)
+{
+	const uint8_t *sp, *ep;
+	size_t len = 0;
+	offset_t off = 0;
+
+	VERIFY3U(start->ss_family, ==, end->ss_family);
+
+	switch (start->ss_family) {
+	case AF_INET:
+		len = sizeof (in_addr_t);
+		off = offsetof(struct sockaddr_in, sin_addr);
+		break;
+	case AF_INET6:
+		len = sizeof (in6_addr_t);
+		off = offsetof(struct sockaddr_in6, sin6_addr);
+		break;
+	default:
+		INVALID(addr->ss_family);
+	}
+
+	sp = (const uint8_t *)start + off;
+	ep = (const uint8_t *)end + off;
+
+	for (size_t i = 0; i < len; i++) {
+		if (sp[i] != 0 || ep[i] != 0)
+			return (B_FALSE);
+	}
+	return (B_TRUE);
+}
+
+void
+sockaddr_copy(const struct sockaddr_storage *src, struct sockaddr_storage *dst,
+    boolean_t copy_port)
+{
+	sockaddr_u_t du = { .sau_ss = dst };
+
+	(void) memcpy(dst, src, sizeof (struct sockaddr_storage));
+	if (!copy_port) {
+		switch (src->ss_family) {
+		case AF_INET:
+			du.sau_sin->sin_port = 0;
+			break;
+		case AF_INET6:
+			du.sau_sin6->sin6_port = 0;
+			break;
+		INVALID(src->ss_family);
+		}
+	}
 }
 
 /* inline parking lot */

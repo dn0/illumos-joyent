@@ -895,6 +895,87 @@ ikev2_add_ts(ikev2_pkt_ts_state_t *restrict tstate, uint8_t ip_proto,
 	return (B_TRUE);
 }
 
+static void
+ts_get_addrs(ikev2_ts_t *restrict ts,
+    struct sockaddr_storage *restrict ss_start,
+    struct sockaddr_storage *restrict ss_end)
+{
+	sockaddr_u_t start = { .sau_ss = ss_start };
+	sockaddr_u_t end = { .sau_ss = ss_end };
+	uint8_t *p = (uint8_t *)(ts + 1);
+	size_t len = 0;
+
+	(void) memset(ss_start, 0, sizeof (*ss_start));
+	(void) memset(ss_end, 0, sizeof (*ss_end));
+
+	switch (ts->ts_type) {
+	case IKEV2_TS_IPV4_ADDR_RANGE:
+		len = sizeof (in_addr_t);
+		if (ss_start != NULL) {
+			ss_start->ss_family = AF_INET;
+			(void) memcpy(&start.sau_sin->sin_addr, p, len);
+			(void) memcpy(&start.sau_sin->sin_port,
+			    &ts->ts_startport, sizeof (uint16_t));
+		}
+		if (ss_end != NULL) {
+			ss_end->ss_family = AF_INET;
+			(void) memcpy(&end.sau_sin->sin_addr, p + len, len);
+			(void) memcpy(&end.sau_sin->sin_port, &ts->ts_endport,
+			    sizeof (uint16_t));
+		}
+		break;
+	case IKEV2_TS_IPV6_ADDR_RANGE:
+		len = sizeof (in6_addr_t);
+		if (ss_start != NULL) {
+			ss_start->ss_family = AF_INET6;
+			(void) memcpy(&start.sau_sin6->sin6_addr, p, len);
+			(void) memcpy(&start.sau_sin6->sin6_port,
+			    &ts->ts_startport, sizeof (uint16_t));
+		}
+		if (ss_end != NULL) {
+			ss_end->ss_family = AF_INET6;
+			(void) memcpy(&end.sau_sin6->sin6_addr, p + len, len);
+			(void) memcpy(&end.sau_sin6->sin6_port, &ts->ts_endport,
+			    sizeof (uint16_t));
+		}
+		break;
+	case IKEV2_TS_FC_ADDR_RANGE:
+		break;
+	}
+}
+
+ikev2_ts_t *
+ikev2_ts_iter(pkt_payload_t *restrict tsp, ikev2_ts_iter_t *restrict iter,
+    struct sockaddr_storage *restrict start,
+    struct sockaddr_storage *restrict end)
+{
+	iter->i2ti_tsp = (ikev2_tsp_t *)tsp->pp_ptr;
+	iter->i2ti_ts = (ikev2_ts_t *)(iter->i2ti_tsp + 1);
+	iter->i2ti_n = 0;
+
+	if (iter->i2ti_n >= iter->i2ti_tsp->tsp_count)
+		return (NULL);
+
+	ts_get_addrs(iter->i2ti_ts, start, end);
+	return (iter->i2ti_ts);
+}
+
+ikev2_ts_t *
+ikev2_ts_iter_next(ikev2_ts_iter_t *restrict iter,
+    struct sockaddr_storage *restrict start,
+    struct sockaddr_storage *restrict end)
+{
+	if (++iter->i2ti_n > iter->i2ti_tsp->tsp_count)
+		return (NULL);
+
+	uint8_t *p = (uint8_t *)iter->i2ti_ts;
+
+	p += BE_IN16(&iter->i2ti_ts->ts_length);
+	iter->i2ti_ts = (ikev2_ts_t *)p;
+	ts_get_addrs(iter->i2ti_ts, start, end);
+	return (iter->i2ti_ts);
+}
+
 static boolean_t add_iv(pkt_t *restrict pkt);
 
 boolean_t

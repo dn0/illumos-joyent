@@ -50,6 +50,12 @@ typedef struct ikev2_pkt_ts_state {
 	uint16_t	i2ts_len;
 } ikev2_pkt_ts_state_t;
 
+typedef struct ikev2_ts_iter_s {
+	ikev2_tsp_t	*i2ti_tsp;
+	ikev2_ts_t	*i2ti_ts;
+	size_t		i2ti_n;
+} ikev2_ts_iter_t;
+
 pkt_t *ikev2_pkt_new_inbound(void *restrict, size_t);
 pkt_t *ikev2_pkt_new_exchange(struct ikev2_sa_s *, ikev2_exch_t);
 pkt_t *ikev2_pkt_new_response(const pkt_t *);
@@ -88,6 +94,11 @@ boolean_t ikev2_add_ts_r(pkt_t *restrict, ikev2_pkt_ts_state_t *restrict);
 boolean_t ikev2_add_ts(ikev2_pkt_ts_state_t *restrict, uint8_t,
     const struct sockaddr_storage *restrict,
     const struct sockaddr_storage *restrict);
+
+ikev2_ts_t *ikev2_ts_iter(pkt_payload_t *restrict, ikev2_ts_iter_t *restrict,
+    struct sockaddr_storage *restrict, struct sockaddr_storage *restrict);
+ikev2_ts_t *ikev2_ts_iter_next(ikev2_ts_iter_t *restrict,
+    struct sockaddr_storage *restrict, struct sockaddr_storage *restrict);
 
 boolean_t ikev2_add_sk(pkt_t *);
 
