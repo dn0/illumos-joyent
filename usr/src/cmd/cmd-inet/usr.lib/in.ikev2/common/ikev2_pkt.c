@@ -19,6 +19,7 @@
 #include <assert.h>
 #include <umem.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <security/cryptoki.h>
@@ -805,7 +806,7 @@ add_ts_common(pkt_t *restrict pkt, ikev2_pkt_ts_state_t *restrict tstate,
 	tsp = (ikev2_tsp_t *)pkt->pkt_ptr;
 
 	tstate->i2ts_pkt = pkt;
-	tstate->i2ts_len = sizeof (ikev2_tsp_t);
+	tstate->i2ts_len = sizeof (ikev2_payload_t);
 	tstate->i2ts_lenp = &payp->pld_length;
 	tstate->i2ts_idx = pkt_get_payload(pkt, ptype, NULL);
 	tstate->i2ts_countp = &tsp->tsp_count;
@@ -814,6 +815,10 @@ add_ts_common(pkt_t *restrict pkt, ikev2_pkt_ts_state_t *restrict tstate,
 
 	/* Skip over the TS header -- we update the count as we add TSes */
 	pkt->pkt_ptr += sizeof (*tsp);
+	tstate->i2ts_len += sizeof (*tsp);
+	tstate->i2ts_idx->pp_len += sizeof (*tsp);
+	BE_OUT16(tstate->i2ts_lenp, tstate->i2ts_len);
+
 	return (B_TRUE);
 }
 
@@ -840,25 +845,18 @@ ikev2_add_ts(ikev2_pkt_ts_state_t *restrict tstate, uint8_t ip_proto,
 	}
 
 	ts.ts_protoid = ip_proto;
+	startptr = ss_addr(ss_start);
+	endptr = ss_addr(ss_end);
+	addrlen = ss_addrlen(ss_start);
+	ts.ts_startport = htons(ss_port(ss_start));
+	ts.ts_endport = htons(ss_port(ss_end));
 
 	switch (start.sau_ss->ss_family) {
 	case AF_INET:
-		startptr = &start.sau_sin->sin_addr;
-		endptr = &end.sau_sin->sin_addr;
-		addrlen = sizeof (in_addr_t);
-
 		ts.ts_type = IKEV2_TS_IPV4_ADDR_RANGE;
-		ts.ts_startport = htons(start.sau_sin->sin_port);
-		ts.ts_endport = htons(end.sau_sin->sin_port);
 		break;
 	case AF_INET6:
-		startptr = &start.sau_sin6->sin6_addr;
-		endptr = &end.sau_sin6->sin6_addr;
-		addrlen = sizeof (in6_addr_t);
-
 		ts.ts_type = IKEV2_TS_IPV6_ADDR_RANGE;
-		ts.ts_startport = htons(start.sau_sin6->sin6_port);
-		ts.ts_endport = htons(end.sau_sin6->sin6_port);
 		break;
 	default:
 		INVALID(start.sau_ss->ss_family);
@@ -905,8 +903,10 @@ ts_get_addrs(ikev2_ts_t *restrict ts,
 	uint8_t *p = (uint8_t *)(ts + 1);
 	size_t len = 0;
 
-	(void) memset(ss_start, 0, sizeof (*ss_start));
-	(void) memset(ss_end, 0, sizeof (*ss_end));
+	if (ss_start != NULL)
+		bzero(ss_start, sizeof (*ss_start));
+	if (ss_end != NULL)
+		bzero(ss_end, sizeof (*ss_end));
 
 	switch (ts->ts_type) {
 	case IKEV2_TS_IPV4_ADDR_RANGE:
@@ -1064,8 +1064,8 @@ add_iv(pkt_t *restrict pkt)
 	}
 	CK_BYTE buf[blocklen];
 
-	(void) memset(buf, 0, blocklen);
-	(void) memcpy(buf, &msgid, sizeof (msgid));
+	bzero(buf, blocklen);
+	bcopy(&msgid, buf, sizeof (msgid));
 
 	rc = C_EncryptInit(h, &mech, key);
 	if (rc != CKR_OK) {
@@ -1079,7 +1079,7 @@ add_iv(pkt_t *restrict pkt)
 		return (B_FALSE);
 	}
 
-	(void) memcpy(pkt->pkt_ptr, buf, MIN(len, blocklen));
+	bcopy(buf, pkt->pkt_ptr, MIN(len, blocklen));
 	explicit_bzero(buf, blocklen);
 	pkt->pkt_ptr += MIN(len, blocklen);
 	return (B_TRUE);
@@ -1144,9 +1144,9 @@ ikev2_pkt_encryptdecrypt(pkt_t *pkt, boolean_t encrypt)
 	outlen = pkt_write_left(pkt) + icvlen;
 	icv = data + datalen;
 
-	(void) memcpy(nonce, iv, ivlen);
+	bcopy(iv, nonce, ivlen);
 	if (sa->saltlen > 0)
-		(void) memcpy(nonce + ivlen, salt, sa->saltlen);
+		bcopy(salt, nonce + ivlen, sa->saltlen);
 
 	if (encrypt) {
 		/* If we're creating it, lengths should match */
@@ -1321,18 +1321,18 @@ ikev2_pkt_signverify(pkt_t *pkt, boolean_t sign)
 	}
 
 	if (sign) {
-		(void) memcpy(icv, outbuf, icvlen);
+		bcopy(outbuf, icv, icvlen);
 		explicit_bzero(outbuf, outlen);
 		return (B_TRUE);
-	}
-
-	if (memcmp(icv, outbuf, icvlen) == 0) {
+	} else if (memcmp(icv, outbuf, icvlen) == 0) {
 		explicit_bzero(outbuf, outlen);
 		return (B_TRUE);
 	}
 
 	(void) bunyan_warn(log, "Payload signature validation failed",
 	    BUNYAN_T_END);
+
+	explicit_bzero(outbuf, outlen);
 	return (B_FALSE);
 }
 
